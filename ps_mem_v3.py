@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ps_mem.py — Analyse optimisée de l’usage mémoire sous Linux (Ubuntu)
+
+Auteur : jsbourguit (script original de Pádraig Brady)
+Version : 4.5
+Compatibilité : Python >= 3.10
+Licence : LGPLv2
+
+Description :
+    Outil d’analyse permettant d’afficher la consommation mémoire réelle
+    des processus Linux, regroupée par programme, par PID ou par pool PHP-FPM
+    selon les options utilisées.
+    Le calcul repose sur les informations fournies par /proc/<pid>/smaps*
+    (prioritairement smaps_rollup lorsqu’il est disponible), en s’appuyant
+    sur le PSS (Proportional Set Size) afin d’obtenir une estimation fiable
+    de la RAM réellement consommée par les processus.
+    L’agrégation est totalisable lorsque le PSS est disponible, garantissant
+    des résultats cohérents en environnement de production.
+
+Améliorations de cette version :
+    - Alignement sur la logique du script ps_mem original :
+        la colonne « RAM used » correspond à Private + Shared, avec
+        une utilisation préférentielle du champ Pss lorsque le kernel
+        le fournit, garantissant un total cohérent et exploitable.
+
+    - Optimisation du calcul mémoire :
+        agrégation contrôlée des HugePages (Private_Hugetlb / Shared_Hugetlb)
+        afin d’éviter tout double comptage et sous-estimation.
+
+    - Support explicite et correct de smaps_rollup :
+        lecture directe des champs Rss, Pss, Private_* et Shared_*,
+        réduisant la charge CPU et améliorant les performances
+        sur serveurs à forte volumétrie de processus.
+
+    - Regroupement fiable des processus PHP-FPM par pool / site :
+        les intitulés de type « php-fpm: pool <site> » sont conservés
+        tels quels afin de fournir une vue mémoire par site applicatif,
+        ce qui n’est pas possible avec les outils standards (ps, top).
+
+    - Filtrage intelligent des processus cibles :
+        limitation optionnelle à certains services (apache, httpd, php, php-fpm)
+        pour une analyse orientée exploitation web.
+
+    - Gestion robuste des processus éphémères :
+        les disparitions de PID entre l’énumération et la lecture
+        de /proc sont traitées proprement sans interrompre l’analyse.
+
+    - Clarification du comportement des options :
+        l’option -t -S affiche exclusivement le total du Swap,
+        avec utilisation prioritaire de SwapPss lorsque disponible.
+
+    - Meilleure gestion des permissions :
+        distinction explicite entre PID inexistants, non lisibles
+        et accès refusés à smaps, avec messages d’erreur clairs.
+
+    - Code modernisé et documenté :
+        annotations de types, commentaires explicatifs et
+        structure lisible facilitant la maintenance et l’évolution
+        future du script.
+"""
+
+import argparse
+from dataclasses import dataclass
+import errno
+import os
+import sys
+import time
+from typing import Dict, List, Set, Tuple
+
+__version__ = "4.4"
+
+OUR_PID = os.getpid()
+
+TARGET_KEYWORDS = ("apache", "httpd", "php", "php-fpm")
+
+
+def std_exceptions(exc_type, value, tb):
+    sys.excepthook = sys.__excepthook__
+    if issubclass(exc_type, (KeyboardInterrupt, BrokenPipeError)):
+        return
+    sys.__excepthook__(exc_type, value, tb)
+
+
+sys.excepthook = std_exceptions
+
+
+class Unbuffered:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data: str) -> None:
+        self.stream.write(data)
+        self.stream.flush()
+
+    def flush(self) -> None:
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        try:
+            return self.stream.isatty()
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+
+
+class Proc:
+    def __init__(self):
+        self.proc = "/proc"
+
+    def path(self, *args: str | int) -> str:
+        return os.path.join(self.proc, *(str(a) for a in args))
+
+    def open(self, *args: str | int):
+        try:
+            return open(self.path(*args), errors="ignore")
+        except OSError as e:
+            if isinstance(args[0], int) and e.errno in (errno.ENOENT, errno.EPERM, errno.EACCES):
+                raise LookupError
+            raise
+
+
+proc = Proc()
+
+
+@dataclass
+class MemoryUsageResult:
+    sorted_cmds: List[Tuple[str, int]]
+    privates: Dict[str, int]
+    counts: Dict[str, int]
+    total_ram_used: int
+    swaps: Dict[str, int]
+    total_swap: int
+    matched_candidates_count: int
+    matched_readable_count: int
+    pss_seen_any: bool
+    found_candidate_pids: set[int]
+    found_readable_pids: set[int]
+
+
+def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
+    parser = argparse.ArgumentParser(description="Show per-program (and PHP-FPM pool) memory usage (PSS based).")
+    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("-s", "--split-args", action="store_true", help="Separate by full command line (not used for pools).")
+    parser.add_argument("-t", "--total", dest="only_total", action="store_true", help="Show only total memory.")
+    parser.add_argument("-d", "--discriminate-by-pid", action="store_true", help="Show by process instead of program.")
+    parser.add_argument("-S", "--swap", dest="show_swap", action="store_true", help="Show swap usage (SwapPss if available).")
+    parser.add_argument("-p", dest="pids", metavar="<pid>[,pid2,...]", help="Filter by PIDs.")
+    parser.add_argument("-w", dest="watch", metavar="<N>", type=int, help="Refresh every N seconds.")
+    args = parser.parse_args()
+
+    pids_to_show: List[int] = []
+    if args.pids:
+        try:
+            pids_to_show = [int(x) for x in args.pids.split(",")]
+        except ValueError:
+            parser.error("Invalid PID list.")
+
+    if args.watch is not None and args.watch <= 0:
+        parser.error("Seconds must be positive!")
+
+    return args.split_args, pids_to_show, args.watch, args.only_total, args.discriminate_by_pid, args.show_swap
+
+
+def _pick_smaps_file(pid: int) -> str:
+    return "smaps_rollup" if os.path.exists(proc.path(pid, "smaps_rollup")) else "smaps"
+
+
+def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
+    """
+    Retourne (private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line)
+    - private_base_kb: somme des Private_Clean/Private_Dirty (rollup) OU Private: (smaps)
+    - pss_kb: somme des Pss:
+    - swap_kb: SwapPss si dispo, sinon Swap
+    - huge_priv_kb: Private_Hugetlb
+    - huge_shared_kb: Shared_Hugetlb
+    """
+    private_base_kb = 0
+    private_cd_kb = 0
+    saw_private_total = False
+    pss_kb = 0
+    swap_kb = 0
+    swap_sum_kb = 0
+    swappss_sum_kb = 0
+    huge_priv_kb = 0
+    huge_shared_kb = 0
+    saw_pss_line = False
+    saw_swappss_line = False
+
+    smaps_file = _pick_smaps_file(pid)
+
+    try:
+        with proc.open(pid, smaps_file) as f:
+            for line in f:
+                # Private (rollup: Private_Clean/Dirty, smaps: Private:)
+                if line.startswith("Private:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        private_base_kb += int(parts[1])
+                        saw_private_total = True
+                elif line.startswith(("Private_Clean:", "Private_Dirty:")):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        private_cd_kb += int(parts[1])
+
+                # HugeTLB (hugetlbfs) est historiquement exclu de RSS/PSS,
+                # donc on le traite a part pour eviter de sous-compter.
+                elif line.startswith("Private_Hugetlb:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        huge_priv_kb += int(parts[1])
+                elif line.startswith("Shared_Hugetlb:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        huge_shared_kb += int(parts[1])
+
+                # PSS
+                elif line.startswith("Pss:"):
+                    saw_pss_line = True
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        pss_kb += int(parts[1])
+
+                # Swap
+                elif line.startswith("SwapPss:"):
+                    saw_swappss_line = True
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        swappss_sum_kb += int(parts[1])
+
+                elif line.startswith("Swap:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        swap_sum_kb += int(parts[1])
+
+    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+        raise LookupError
+
+    if not saw_private_total:
+        private_base_kb = private_cd_kb
+
+    swap_kb = swappss_sum_kb if saw_swappss_line else swap_sum_kb
+    return private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line
+
+
+def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool = False) -> str:
+    """
+    Conserve le titre PHP-FPM (pool) si présent.
+    Sinon, retombe sur l'exécutable.
+    """
+    try:
+        with proc.open(pid, "cmdline") as f:
+            raw = f.read()
+
+        cmdline0 = ""
+        cmdline_full = ""
+        if raw:
+            parts = [p for p in raw.split("\0") if p]
+            if parts:
+                cmdline0 = parts[0]
+                cmdline_full = " ".join(parts)
+
+        # PHP-FPM: on garde le title complet pour regrouper par pool
+        if cmdline0.startswith("php-fpm:"):
+            cmd = cmdline0
+        elif split_args and cmdline_full:
+            cmd = cmdline_full
+        else:
+            try:
+                exe_target = os.readlink(proc.path(pid, "exe"))
+                exe_target = exe_target.split("\0")[0]
+                cmd = os.path.basename(exe_target) if exe_target else (os.path.basename(cmdline0) if cmdline0 else f"proc-{pid}")
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                cmd = os.path.basename(cmdline0) if cmdline0 else f"proc-{pid}"
+
+        if discriminate_by_pid:
+            cmd = f"{cmd} [{pid}]"
+        return cmd
+
+    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+        return f"proc-{pid}"
+    except Exception:
+        return f"proc-{pid}"
+
+
+def human(kb: float) -> str:
+    units = ["KiB", "MiB", "GiB", "TiB"]
+    v = float(kb)
+    for u in units:
+        if v < 1024:
+            return f"{v:.1f} {u}"
+        v /= 1024
+    return f"{v:.1f} PiB"
+
+
+def cmd_with_count(cmd: str, count: int) -> str:
+    return f"{cmd} ({count})" if count > 1 else cmd
+
+
+def _is_smaps_mapping_header(line: str) -> bool:
+    parts = line.split(None, 5)
+    if len(parts) < 5:
+        return False
+    return parts[0].count("-") == 1
+
+
+def _segment_key_from_smaps_header(line: str) -> Tuple[str, str, str, str, int]:
+    """
+    Cle stable inter-process pour approximer un segment partage :
+    (dev, inode, offset, pathname, mapping_len_kb)
+    """
+    parts = line.strip().split(None, 5)
+    addr = parts[0]
+    offset = parts[2]
+    dev = parts[3]
+    inode = parts[4]
+    pathname = parts[5] if len(parts) >= 6 else ""
+    try:
+        start_hex, end_hex = addr.split("-", 1)
+        mapping_len_kb = max(0, (int(end_hex, 16) - int(start_hex, 16)) // 1024)
+    except Exception:
+        mapping_len_kb = 0
+    return dev, inode, offset, pathname, mapping_len_kb
+
+
+def estimate_shared_hugetlb_pss_like(pid_to_cmd: Dict[int, str], candidate_pids: Set[int]) -> Tuple[Dict[str, int], int]:
+    """
+    Estime Shared_Hugetlb par commande via une repartition "pss-like":
+    - lecture de /proc/<pid>/smaps pour les seuls PID candidats
+    - deduplication des segments partages via cle de segment
+    - repartition de chaque segment selon le nb de mappeurs par commande
+
+    Retourne ({cmd: kb}, failed_pid_count).
+    """
+    segment_sizes: Dict[Tuple[str, str, str, str, int], int] = {}
+    segment_mappers: Dict[Tuple[str, str, str, str, int], Set[int]] = {}
+    failed_pid_count = 0
+
+    for pid in candidate_pids:
+        current_key: Tuple[str, str, str, str, int] | None = None
+        current_shared_huge_kb = 0
+        try:
+            with proc.open(pid, "smaps") as f:
+                for line in f:
+                    if _is_smaps_mapping_header(line):
+                        if current_key is not None and current_shared_huge_kb > 0:
+                            if segment_sizes.get(current_key, 0) < current_shared_huge_kb:
+                                segment_sizes[current_key] = current_shared_huge_kb
+                            segment_mappers.setdefault(current_key, set()).add(pid)
+                        current_key = _segment_key_from_smaps_header(line)
+                        current_shared_huge_kb = 0
+                    elif line.startswith("Shared_Hugetlb:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            current_shared_huge_kb = int(parts[1])
+                if current_key is not None and current_shared_huge_kb > 0:
+                    if segment_sizes.get(current_key, 0) < current_shared_huge_kb:
+                        segment_sizes[current_key] = current_shared_huge_kb
+                    segment_mappers.setdefault(current_key, set()).add(pid)
+        except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+            failed_pid_count += 1
+            continue
+        except Exception:
+            failed_pid_count += 1
+            continue
+
+    per_cmd_float: Dict[str, float] = {}
+    for key, size_kb in segment_sizes.items():
+        mappers = segment_mappers.get(key, set())
+        if size_kb <= 0 or not mappers:
+            continue
+
+        total_mappers = len(mappers)
+        if total_mappers == 0:
+            continue
+
+        cmd_mapper_counts: Dict[str, int] = {}
+        for pid in mappers:
+            cmd = pid_to_cmd.get(pid)
+            if not cmd:
+                continue
+            cmd_mapper_counts[cmd] = cmd_mapper_counts.get(cmd, 0) + 1
+
+        for cmd, mapper_count in cmd_mapper_counts.items():
+            per_cmd_float[cmd] = per_cmd_float.get(cmd, 0.0) + (size_kb * mapper_count / total_mappers)
+
+    per_cmd_kb = {cmd: int(round(val)) for cmd, val in per_cmd_float.items() if val > 0}
+    return per_cmd_kb, failed_pid_count
+
+
+def get_memory_usage(
+    pids_to_show: List[int],
+    split_args: bool,
+    discriminate_by_pid: bool,
+) -> MemoryUsageResult:
+    """
+    Retourne une structure agregee de consommation memoire.
+    """
+    psses: Dict[str, int] = {}
+    private_bases: Dict[str, int] = {}
+    huge_privs: Dict[str, int] = {}
+    huge_shareds: Dict[str, int] = {}
+    privates: Dict[str, int] = {}
+    ram_useds: Dict[str, int] = {}
+    counts: Dict[str, int] = {}
+    swaps: Dict[str, int] = {}
+    matched_candidates_count = 0
+    matched_readable_count = 0
+    pss_seen_any = False
+    found_candidate_pids: set[int] = set()
+    found_readable_pids: set[int] = set()
+    pid_to_cmd_readable: Dict[int, str] = {}
+    shared_hugetlb_candidate_pids: Set[int] = set()
+
+    for pid_str in os.listdir(proc.path("")):
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+
+        if pids_to_show and pid not in pids_to_show:
+            continue
+        if pid == OUR_PID:
+            continue
+
+        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
+        cmd_lower = cmd.lower()
+        # RUN : Si -p est utilise, on respecte les PIDs explicites et on saute
+        # le filtrage TARGET_KEYWORDS.
+        if not pids_to_show:
+            if not any(keyword in cmd_lower for keyword in TARGET_KEYWORDS):
+                continue
+        if pids_to_show:
+            found_candidate_pids.add(pid)
+        matched_candidates_count += 1
+
+        try:
+            private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line = get_mem_stats(pid)
+        except LookupError:
+            continue
+        except Exception as e:
+            print(f"[WARN] Failed to read PID {pid}: {e}", file=sys.stderr)
+            continue
+        matched_readable_count += 1
+        if pids_to_show:
+            found_readable_pids.add(pid)
+        pid_to_cmd_readable[pid] = cmd
+        if huge_shared_kb > 0:
+            shared_hugetlb_candidate_pids.add(pid)
+        pss_seen_any = pss_seen_any or saw_pss_line
+
+        # PSS totalisable : somme directe
+        psses[cmd] = psses.get(cmd, 0) + pss_kb
+
+        # Private base totalisable : somme directe (hors huge)
+        private_bases[cmd] = private_bases.get(cmd, 0) + private_base_kb
+
+        # Huge private totalisable : somme directe
+        huge_privs[cmd] = huge_privs.get(cmd, 0) + huge_priv_kb
+
+        # Huge shared : aggregation par MAX pour eviter le double comptage
+        if cmd in huge_shareds:
+            if huge_shareds[cmd] < huge_shared_kb:
+                huge_shareds[cmd] = huge_shared_kb
+        else:
+            huge_shareds[cmd] = huge_shared_kb
+
+        # Swap totalisable si SwapPss dispo, sinon c'est une approximation (comme original)
+        swaps[cmd] = swaps.get(cmd, 0) + swap_kb
+
+        counts[cmd] = counts.get(cmd, 0) + 1
+
+    if shared_hugetlb_candidate_pids:
+        pss_like_shared_hugetlb, failed_pid_count = estimate_shared_hugetlb_pss_like(
+            pid_to_cmd=pid_to_cmd_readable,
+            candidate_pids=shared_hugetlb_candidate_pids,
+        )
+        # max reste une borne basse de securite; on prend la meilleure estimation.
+        for cmd, pss_like_kb in pss_like_shared_hugetlb.items():
+            if huge_shareds.get(cmd, 0) < pss_like_kb:
+                huge_shareds[cmd] = pss_like_kb
+        if failed_pid_count:
+            print(
+                f"[WARN] Shared_Hugetlb precise pass skipped {failed_pid_count} PID(s); kept max-based floor.",
+                file=sys.stderr,
+            )
+
+    for cmd in psses:
+        private_base_total = private_bases.get(cmd, 0)
+        huge_priv_total = huge_privs.get(cmd, 0)
+        huge_shared_total = huge_shareds.get(cmd, 0)
+        privates[cmd] = private_base_total + huge_priv_total
+        ram_useds[cmd] = psses.get(cmd, 0) + huge_priv_total + huge_shared_total
+        if ram_useds[cmd] < privates[cmd]:
+            ram_useds[cmd] = privates[cmd]
+
+    total_ram_used = sum(ram_useds.values())
+    total_swap = sum(swaps.values())
+    sorted_cmds = sorted(ram_useds.items(), key=lambda x: x[1], reverse=True)
+
+    return MemoryUsageResult(
+        sorted_cmds=sorted_cmds,
+        privates=privates,
+        counts=counts,
+        total_ram_used=total_ram_used,
+        swaps=swaps,
+        total_swap=total_swap,
+        matched_candidates_count=matched_candidates_count,
+        matched_readable_count=matched_readable_count,
+        pss_seen_any=pss_seen_any,
+        found_candidate_pids=found_candidate_pids,
+        found_readable_pids=found_readable_pids,
+    )
+
+
+def print_header(show_swap: bool) -> None:
+    hdr = f"{'Private':>9} + {'Shared':>9} = {'RAM used':>9}"
+    if show_swap:
+        hdr += f"   {'Swap used':>9}"
+    print(f"{hdr}\tProgram\n{'-' * 60}")
+
+
+def print_timestamp() -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    stream = sys.stdout if sys.stdout.isatty() else sys.stderr
+    print(f"Timestamp: {stamp}", file=stream)
+
+
+def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, total_swap, show_swap: bool) -> None:
+    for cmd, ram_used in sorted_cmds:
+        private = privates.get(cmd, 0)
+        # Shared "proportionnel" pour que Private + Shared = RAM used
+        shared = ram_used - private
+
+        line = f"{human(private):>9} + {human(shared):>9} = {human(ram_used):>9}"
+        if show_swap:
+            line += f"   {human(swaps.get(cmd, 0)):>9}"
+        print(f"{line}\t{cmd_with_count(cmd, counts[cmd])}")
+
+    # RUN : Le pied de page inclut le Swap uniquement si -S/--swap est demande.
+    if show_swap:
+        print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM, {human(total_swap)} Swap\n")
+    else:
+        print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM\n")
+
+
+def main() -> None:
+    sys.stdout = Unbuffered(sys.stdout)
+    sys.stderr = Unbuffered(sys.stderr)
+
+    split_args, pids_to_show, watch, only_total, discriminate_by_pid, show_swap = parse_options()
+
+    if os.geteuid() != 0 and not pids_to_show:
+        print("Root permissions required or specify PIDs with -p", file=sys.stderr)
+        sys.exit(1)
+
+    while True:
+        # RUN : On distingue PIDs candidats vs lisibles pour eviter un faux
+        # "PSS absent" quand un process disparait ou que smaps est illisible.
+        # En mode watch, on continue la surveillance (continue) au lieu de sortir.
+        # SwapPss est prefere a Swap quand present pour eviter un melange de modes.
+        print_timestamp()
+        result = get_memory_usage(
+            pids_to_show=pids_to_show,
+            split_args=split_args,
+            discriminate_by_pid=discriminate_by_pid,
+        )
+
+        if result.matched_candidates_count == 0:
+            if only_total:
+                print(human(0))
+            else:
+                if pids_to_show:
+                    print(f"No processes found for specified PIDs (not present in /proc): {', '.join(str(pid) for pid in pids_to_show)}")
+                else:
+                    print(f"No matching processes for keywords: {', '.join(TARGET_KEYWORDS)}")
+            if watch is None:
+                sys.exit(0)
+            time.sleep(watch)
+            continue
+
+        if result.matched_readable_count == 0:
+            if pids_to_show:
+                missing = set(pids_to_show) - result.found_candidate_pids
+                unreadable = result.found_candidate_pids - result.found_readable_pids
+                if unreadable:
+                    msg = (
+                        "ERROR: Specified PIDs present but none readable via smaps*: "
+                        f"{', '.join(str(pid) for pid in sorted(unreadable))}."
+                    )
+                    if missing:
+                        msg += f" Missing: {', '.join(str(pid) for pid in sorted(missing))}."
+                    print(msg, file=sys.stderr)
+                elif missing:
+                    print(
+                        f"ERROR: Specified PIDs missing from /proc: {', '.join(str(pid) for pid in sorted(missing))}.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "ERROR: Specified PIDs found but none readable (smaps access/permissions/process exit).",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    "ERROR: Matching processes found but none readable (smaps access/permissions/process exit).",
+                    file=sys.stderr,
+                )
+            if watch is None:
+                sys.exit(2)
+            time.sleep(watch)
+            continue
+
+        # On echoue rapidement si PSS est absent pour eviter d'afficher des zeros trompeurs.
+        if not result.pss_seen_any:
+            print(
+                "ERROR: PSS not available/readable (no 'Pss:' lines found in smaps/smaps_rollup). Results would be unreliable.",
+                file=sys.stderr,
+            )
+            if watch is None:
+                sys.exit(2)
+            time.sleep(watch)
+            continue
+
+        if not only_total:
+            print_header(show_swap)
+
+        if only_total:
+            print(human(result.total_swap if show_swap else result.total_ram_used))
+        else:
+            print_memory_usage(
+                result.sorted_cmds,
+                result.privates,
+                result.counts,
+                result.total_ram_used,
+                result.swaps,
+                result.total_swap,
+                show_swap,
+            )
+
+        if watch is None:
+            break
+        time.sleep(watch)
+
+
+if __name__ == "__main__":
+    main()
