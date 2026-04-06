@@ -5,7 +5,7 @@
 ps_mem.py — Analyse optimisée de l’usage mémoire sous Linux (Ubuntu)
 
 Auteur : jsbourguit (script original de Pádraig Brady)
-Version : 4.5
+Version : 4.6
 Compatibilité : Python >= 3.10
 Licence : LGPLv2
 
@@ -31,7 +31,7 @@ Améliorations de cette version :
         afin d’éviter tout double comptage et sous-estimation.
 
     - Support explicite et correct de smaps_rollup :
-        lecture directe des champs Rss, Pss, Private_* et Shared_*,
+        lecture directe des champs Pss, Private_* et HugeTLB associe,
         réduisant la charge CPU et améliorant les performances
         sur serveurs à forte volumétrie de processus.
 
@@ -70,7 +70,7 @@ import sys
 import time
 from typing import Dict, List, Set, Tuple
 
-__version__ = "4.4"
+__version__ = "4.6"
 
 OUR_PID = os.getpid()
 
@@ -118,6 +118,21 @@ class Unbuffered:
             pass
 
 
+class ProcLookupError(LookupError):
+    def __init__(self, pid: int, entry: str):
+        self.pid = pid
+        self.entry = entry
+        super().__init__(f"/proc/{pid}/{entry}" if entry else f"/proc/{pid}")
+
+
+class ProcNotFound(ProcLookupError):
+    pass
+
+
+class ProcAccessDenied(ProcLookupError):
+    pass
+
+
 class Proc:
     def __init__(self):
         self.proc = "/proc"
@@ -129,8 +144,13 @@ class Proc:
         try:
             return open(self.path(*args), errors="ignore")
         except OSError as e:
-            if isinstance(args[0], int) and e.errno in (errno.ENOENT, errno.EPERM, errno.EACCES):
-                raise LookupError
+            if args and isinstance(args[0], int):
+                pid = int(args[0])
+                entry = "/".join(str(a) for a in args[1:])
+                if e.errno in (errno.ENOENT, errno.ESRCH):
+                    raise ProcNotFound(pid, entry) from e
+                if e.errno in (errno.EPERM, errno.EACCES):
+                    raise ProcAccessDenied(pid, entry) from e
             raise
 
 
@@ -150,6 +170,8 @@ class MemoryUsageResult:
     pss_seen_any: bool
     found_candidate_pids: set[int]
     found_readable_pids: set[int]
+    found_access_denied_pids: set[int]
+    found_missing_runtime_pids: set[int]
 
 
 def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
@@ -176,10 +198,6 @@ def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
     return args.split_args, pids_to_show, args.watch, args.only_total, args.discriminate_by_pid, args.show_swap
 
 
-def _pick_smaps_file(pid: int) -> str:
-    return "smaps_rollup" if os.path.exists(proc.path(pid, "smaps_rollup")) else "smaps"
-
-
 def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
     """
     Retourne (private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line)
@@ -201,10 +219,32 @@ def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
     saw_pss_line = False
     saw_swappss_line = False
 
-    smaps_file = _pick_smaps_file(pid)
+    smaps_handle = None
+    smaps_file_used = ""
+    last_lookup_error: ProcLookupError | None = None
+    for smaps_file in ("smaps_rollup", "smaps"):
+        try:
+            smaps_handle = proc.open(pid, smaps_file)
+            smaps_file_used = smaps_file
+            break
+        except ProcAccessDenied as e:
+            # Cause prioritaire si aucun fallback lisible n'est possible.
+            last_lookup_error = e
+            continue
+        except ProcNotFound as e:
+            if last_lookup_error is None:
+                last_lookup_error = e
+            continue
+        except (FileNotFoundError, ProcessLookupError, OSError):
+            continue
+
+    if smaps_handle is None:
+        if last_lookup_error is not None:
+            raise last_lookup_error
+        raise LookupError
 
     try:
-        with proc.open(pid, smaps_file) as f:
+        with smaps_handle as f:
             for line in f:
                 # Private (rollup: Private_Clean/Dirty, smaps: Private:)
                 if line.startswith("Private:"):
@@ -246,8 +286,13 @@ def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
                     parts = line.split()
                     if len(parts) >= 2:
                         swap_sum_kb += int(parts[1])
-
-    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+    except ProcLookupError:
+        raise
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ESRCH):
+            raise ProcNotFound(pid, smaps_file_used or "smaps*") from e
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise ProcAccessDenied(pid, smaps_file_used or "smaps*") from e
         raise LookupError
 
     if not saw_private_total:
@@ -295,6 +340,45 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
         return f"proc-{pid}"
     except Exception:
         return f"proc-{pid}"
+
+
+def _fast_comm_name(pid: int) -> str:
+    """Nom leger via /proc/<pid>/comm (peu couteux)."""
+    try:
+        with proc.open(pid, "comm") as f:
+            comm = f.read().strip().split("\0")[0]
+            if comm:
+                return comm
+    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+        pass
+    return ""
+
+
+def _fast_exe_name(pid: int) -> str:
+    """Nom de binaire via basename(/proc/<pid>/exe)."""
+    try:
+        exe_target = os.readlink(proc.path(pid, "exe"))
+        exe_target = exe_target.split("\0")[0]
+        if exe_target:
+            return os.path.basename(exe_target)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        pass
+
+    return ""
+
+
+def _matches_target_keywords_fast(pid: int) -> bool:
+    # 1) Essai ultra-leger via comm.
+    comm_name = _fast_comm_name(pid).lower()
+    if comm_name and any(keyword in comm_name for keyword in TARGET_KEYWORDS):
+        return True
+
+    # 2) Fallback sur basename de l'exe, utile si comm est tronque.
+    exe_name = _fast_exe_name(pid).lower()
+    if exe_name and any(keyword in exe_name for keyword in TARGET_KEYWORDS):
+        return True
+
+    return False
 
 
 def human(kb: float) -> str:
@@ -423,6 +507,8 @@ def get_memory_usage(
     pss_seen_any = False
     found_candidate_pids: set[int] = set()
     found_readable_pids: set[int] = set()
+    found_access_denied_pids: set[int] = set()
+    found_missing_runtime_pids: set[int] = set()
     pid_to_cmd_readable: Dict[int, str] = {}
     shared_hugetlb_candidate_pids: Set[int] = set()
 
@@ -436,12 +522,12 @@ def get_memory_usage(
         if pid == OUR_PID:
             continue
 
-        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
-        cmd_lower = cmd.lower()
         # RUN : Si -p est utilise, on respecte les PIDs explicites et on saute
         # le filtrage TARGET_KEYWORDS.
+        # Sinon, pre-filtrage leger via /proc/<pid>/comm (fallback exe) pour
+        # eviter le cout de get_cmd_name() sur la majorite des processus.
         if not pids_to_show:
-            if not any(keyword in cmd_lower for keyword in TARGET_KEYWORDS):
+            if not _matches_target_keywords_fast(pid):
                 continue
         if pids_to_show:
             found_candidate_pids.add(pid)
@@ -449,11 +535,23 @@ def get_memory_usage(
 
         try:
             private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line = get_mem_stats(pid)
+        except ProcAccessDenied:
+            if pids_to_show:
+                found_access_denied_pids.add(pid)
+            continue
+        except ProcNotFound:
+            if pids_to_show:
+                found_missing_runtime_pids.add(pid)
+            continue
         except LookupError:
             continue
         except Exception as e:
             print(f"[WARN] Failed to read PID {pid}: {e}", file=sys.stderr)
             continue
+
+        # On ne calcule le nom "complet" qu'apres validation du candidat et
+        # lecture memoire reussie.
+        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
         matched_readable_count += 1
         if pids_to_show:
             found_readable_pids.add(pid)
@@ -494,7 +592,8 @@ def get_memory_usage(
                 huge_shareds[cmd] = pss_like_kb
         if failed_pid_count:
             print(
-                f"[WARN] Shared_Hugetlb precise pass skipped {failed_pid_count} PID(s); kept max-based floor.",
+                f"[WARN] Shared_Hugetlb precise pass skipped {failed_pid_count} PID(s); "
+                "kept max-based conservative floor (possible underestimation).",
                 file=sys.stderr,
             )
 
@@ -523,6 +622,8 @@ def get_memory_usage(
         pss_seen_any=pss_seen_any,
         found_candidate_pids=found_candidate_pids,
         found_readable_pids=found_readable_pids,
+        found_access_denied_pids=found_access_denied_pids,
+        found_missing_runtime_pids=found_missing_runtime_pids,
     )
 
 
@@ -555,6 +656,56 @@ def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, tot
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM, {human(total_swap)} Swap\n")
     else:
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM\n")
+
+
+def _pid_issue_sets(result: MemoryUsageResult, requested_pids: List[int]) -> Tuple[set[int], set[int], set[int], set[int]]:
+    missing_from_proc = set(requested_pids) - result.found_candidate_pids
+    access_denied = result.found_access_denied_pids
+    disappeared_runtime = result.found_missing_runtime_pids
+    unreadable_other = (
+        result.found_candidate_pids
+        - result.found_readable_pids
+        - access_denied
+        - disappeared_runtime
+    )
+    return missing_from_proc, access_denied, disappeared_runtime, unreadable_other
+
+
+def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[int], level: str) -> bool:
+    missing_from_proc, access_denied, disappeared_runtime, unreadable_other = _pid_issue_sets(result, requested_pids)
+    emitted = False
+    prefix = f"{level}: "
+
+    if access_denied:
+        print(
+            prefix + "Access denied reading smaps* for PID(s): "
+            f"{', '.join(str(pid) for pid in sorted(access_denied))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if disappeared_runtime:
+        print(
+            prefix + "PID(s) disappeared during collection: "
+            f"{', '.join(str(pid) for pid in sorted(disappeared_runtime))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if missing_from_proc:
+        print(
+            prefix + "Specified PIDs missing from /proc: "
+            f"{', '.join(str(pid) for pid in sorted(missing_from_proc))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if unreadable_other:
+        print(
+            prefix + "Specified PIDs present but unreadable via smaps* (unknown cause): "
+            f"{', '.join(str(pid) for pid in sorted(unreadable_other))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+
+    return emitted
 
 
 def main() -> None:
@@ -594,22 +745,8 @@ def main() -> None:
 
         if result.matched_readable_count == 0:
             if pids_to_show:
-                missing = set(pids_to_show) - result.found_candidate_pids
-                unreadable = result.found_candidate_pids - result.found_readable_pids
-                if unreadable:
-                    msg = (
-                        "ERROR: Specified PIDs present but none readable via smaps*: "
-                        f"{', '.join(str(pid) for pid in sorted(unreadable))}."
-                    )
-                    if missing:
-                        msg += f" Missing: {', '.join(str(pid) for pid in sorted(missing))}."
-                    print(msg, file=sys.stderr)
-                elif missing:
-                    print(
-                        f"ERROR: Specified PIDs missing from /proc: {', '.join(str(pid) for pid in sorted(missing))}.",
-                        file=sys.stderr,
-                    )
-                else:
+                emitted = _print_pid_issue_messages(result, pids_to_show, level="ERROR")
+                if not emitted:
                     print(
                         "ERROR: Specified PIDs found but none readable (smaps access/permissions/process exit).",
                         file=sys.stderr,
@@ -623,6 +760,12 @@ def main() -> None:
                 sys.exit(2)
             time.sleep(watch)
             continue
+
+        # En mode -p, avertir aussi en cas d'erreurs partielles (si au moins un
+        # PID est lisible, on continue mais on n'ignore pas silencieusement les
+        # PID refuses/disparus/manquants).
+        if pids_to_show:
+            _print_pid_issue_messages(result, pids_to_show, level="WARN")
 
         # On echoue rapidement si PSS est absent pour eviter d'afficher des zeros trompeurs.
         if not result.pss_seen_any:
