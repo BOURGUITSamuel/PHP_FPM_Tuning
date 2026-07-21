@@ -45,8 +45,8 @@ Améliorations de cette version :
         pour une analyse orientée exploitation web.
 
     - Gestion robuste des processus éphémères :
-        les disparitions de PID entre l’énumération et la lecture
-        de /proc sont traitées proprement sans interrompre l’analyse.
+        l'identité issue de /proc/<pid>/stat est contrôlée avant et après
+        la collecte pour ignorer les PID disparus ou réutilisés.
 
     - Clarification du comportement des options :
         l’option -t -S affiche exclusivement le total du Swap,
@@ -75,6 +75,11 @@ __version__ = "4.6"
 OUR_PID = os.getpid()
 
 TARGET_KEYWORDS = ("apache", "httpd", "php", "php-fpm")
+MAX_COMMAND_CHARS = 4096
+MAX_PROC_STAT_CHARS = 4096
+PROC_STAT_STARTTIME_INDEX = 22 - 3  # Champs 3+ après la parenthèse de comm.
+
+SegmentKey = Tuple[str, str, str, str, int]
 
 
 def std_exceptions(exc_type, value, tb):
@@ -133,6 +138,10 @@ class ProcAccessDenied(ProcLookupError):
     pass
 
 
+class ProcInvalidData(ProcLookupError):
+    pass
+
+
 class Proc:
     def __init__(self):
         self.proc = "/proc"
@@ -142,7 +151,12 @@ class Proc:
 
     def open(self, *args: str | int):
         try:
-            return open(self.path(*args), errors="ignore")
+            return open(
+                self.path(*args),
+                encoding="utf-8",
+                errors="surrogateescape",
+                newline="",
+            )
         except OSError as e:
             if args and isinstance(args[0], int):
                 pid = int(args[0])
@@ -172,6 +186,7 @@ class MemoryUsageResult:
     found_readable_pids: set[int]
     found_access_denied_pids: set[int]
     found_missing_runtime_pids: set[int]
+    found_reused_pids: set[int]
 
 
 def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
@@ -186,11 +201,17 @@ def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
     args = parser.parse_args()
 
     pids_to_show: List[int] = []
-    if args.pids:
+    if args.pids is not None:
         try:
-            pids_to_show = [int(x) for x in args.pids.split(",")]
+            pid_values = [value.strip() for value in args.pids.split(",")]
+            if any(not value.isascii() or not value.isdecimal() for value in pid_values):
+                raise ValueError
+            parsed_pids = [int(value) for value in pid_values]
+            if any(pid <= 0 for pid in parsed_pids):
+                raise ValueError
+            pids_to_show = list(dict.fromkeys(parsed_pids))
         except ValueError:
-            parser.error("Invalid PID list.")
+            parser.error("PIDs must be positive integers separated by commas.")
 
     if args.watch is not None and args.watch <= 0:
         parser.error("Seconds must be positive!")
@@ -309,7 +330,11 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
     """
     try:
         with proc.open(pid, "cmdline") as f:
-            raw = f.read()
+            raw = f.read(MAX_COMMAND_CHARS + 1)
+
+        cmdline_truncated = len(raw) > MAX_COMMAND_CHARS
+        raw = raw[:MAX_COMMAND_CHARS]
+        first_arg_truncated = cmdline_truncated and "\0" not in raw
 
         cmdline0 = ""
         cmdline_full = ""
@@ -322,16 +347,28 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
         # PHP-FPM: on garde le title complet pour regrouper par pool
         if cmdline0.startswith("php-fpm:"):
             cmd = cmdline0
+            command_was_truncated = first_arg_truncated
         elif split_args and cmdline_full:
             cmd = cmdline_full
+            command_was_truncated = cmdline_truncated
         else:
+            command_was_truncated = False
             try:
                 exe_target = os.readlink(proc.path(pid, "exe"))
                 exe_target = exe_target.split("\0")[0]
-                cmd = os.path.basename(exe_target) if exe_target else (os.path.basename(cmdline0) if cmdline0 else f"proc-{pid}")
+                if exe_target:
+                    cmd = os.path.basename(exe_target)
+                elif cmdline0:
+                    cmd = os.path.basename(cmdline0)
+                    command_was_truncated = first_arg_truncated
+                else:
+                    cmd = f"proc-{pid}"
             except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
                 cmd = os.path.basename(cmdline0) if cmdline0 else f"proc-{pid}"
+                command_was_truncated = bool(cmdline0) and first_arg_truncated
 
+        if command_was_truncated:
+            cmd = f"[truncated pid={pid}] {cmd}"
         if discriminate_by_pid:
             cmd = f"{cmd} [{pid}]"
         return cmd
@@ -342,16 +379,38 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
         return f"proc-{pid}"
 
 
-def _fast_comm_name(pid: int) -> str:
-    """Nom leger via /proc/<pid>/comm (peu couteux)."""
+def get_process_identity(pid: int) -> Tuple[str, int]:
+    """Retourne (comm, starttime) depuis /proc/<pid>/stat."""
     try:
-        with proc.open(pid, "comm") as f:
-            comm = f.read().strip().split("\0")[0]
-            if comm:
-                return comm
-    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
-        pass
-    return ""
+        with proc.open(pid, "stat") as f:
+            stat_line = f.read(MAX_PROC_STAT_CHARS)
+    except ProcLookupError:
+        raise
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ESRCH):
+            raise ProcNotFound(pid, "stat") from e
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise ProcAccessDenied(pid, "stat") from e
+        raise
+
+    if not stat_line:
+        raise ProcNotFound(pid, "stat")
+
+    comm_start = stat_line.find("(")
+    comm_end = stat_line.rfind(")")
+    if comm_start < 0 or comm_end <= comm_start:
+        raise ProcInvalidData(pid, "stat")
+
+    stat_fields = stat_line[comm_end + 1:].split()
+    if len(stat_fields) <= PROC_STAT_STARTTIME_INDEX:
+        raise ProcInvalidData(pid, "stat")
+
+    try:
+        starttime = int(stat_fields[PROC_STAT_STARTTIME_INDEX])
+    except ValueError as e:
+        raise ProcInvalidData(pid, "stat") from e
+
+    return stat_line[comm_start + 1:comm_end], starttime
 
 
 def _fast_exe_name(pid: int) -> str:
@@ -367,9 +426,9 @@ def _fast_exe_name(pid: int) -> str:
     return ""
 
 
-def _matches_target_keywords_fast(pid: int) -> bool:
-    # 1) Essai ultra-leger via comm.
-    comm_name = _fast_comm_name(pid).lower()
+def _matches_target_keywords_fast(pid: int, comm_name: str) -> bool:
+    # 1) Nom comm deja lu avec l'identite du processus.
+    comm_name = comm_name.lower()
     if comm_name and any(keyword in comm_name for keyword in TARGET_KEYWORDS):
         return True
 
@@ -391,8 +450,17 @@ def human(kb: float) -> str:
     return f"{v:.1f} PiB"
 
 
+def safe_command_text(command: str) -> str:
+    """Retourne une représentation ASCII sûre et bornée pour l'affichage."""
+    safe_command = ascii(command)[1:-1]
+    if len(safe_command) > MAX_COMMAND_CHARS:
+        safe_command = f"{safe_command[:MAX_COMMAND_CHARS - 3]}..."
+    return safe_command
+
+
 def cmd_with_count(cmd: str, count: int) -> str:
-    return f"{cmd} ({count})" if count > 1 else cmd
+    safe_cmd = safe_command_text(cmd)
+    return f"{safe_cmd} ({count})" if count > 1 else safe_cmd
 
 
 def _is_smaps_mapping_header(line: str) -> bool:
@@ -402,7 +470,7 @@ def _is_smaps_mapping_header(line: str) -> bool:
     return parts[0].count("-") == 1
 
 
-def _segment_key_from_smaps_header(line: str) -> Tuple[str, str, str, str, int]:
+def _segment_key_from_smaps_header(line: str) -> SegmentKey:
     """
     Cle stable inter-process pour approximer un segment partage :
     (dev, inode, offset, pathname, mapping_len_kb)
@@ -421,46 +489,75 @@ def _segment_key_from_smaps_header(line: str) -> Tuple[str, str, str, str, int]:
     return dev, inode, offset, pathname, mapping_len_kb
 
 
-def estimate_shared_hugetlb_pss_like(pid_to_cmd: Dict[int, str], candidate_pids: Set[int]) -> Tuple[Dict[str, int], int]:
+def _record_shared_hugetlb_segment(
+    segments: Dict[SegmentKey, int],
+    key: SegmentKey | None,
+    size_kb: int,
+) -> None:
+    if key is not None and size_kb > segments.get(key, 0):
+        segments[key] = size_kb
+
+
+def estimate_shared_hugetlb_pss_like(
+    pid_to_cmd: Dict[int, str],
+    pid_starttimes: Dict[int, int],
+    candidate_pids: Set[int],
+) -> Tuple[Dict[str, int], int]:
     """
     Estime Shared_Hugetlb par commande via une repartition "pss-like":
     - lecture de /proc/<pid>/smaps pour les seuls PID candidats
+    - validation de l'identite du PID avant et apres chaque lecture
     - deduplication des segments partages via cle de segment
     - repartition de chaque segment selon le nb de mappeurs par commande
 
     Retourne ({cmd: kb}, failed_pid_count).
     """
-    segment_sizes: Dict[Tuple[str, str, str, str, int], int] = {}
-    segment_mappers: Dict[Tuple[str, str, str, str, int], Set[int]] = {}
+    segment_sizes: Dict[SegmentKey, int] = {}
+    segment_mappers: Dict[SegmentKey, Set[int]] = {}
     failed_pid_count = 0
 
     for pid in candidate_pids:
-        current_key: Tuple[str, str, str, str, int] | None = None
+        expected_starttime = pid_starttimes.get(pid)
+        if expected_starttime is None:
+            failed_pid_count += 1
+            continue
+
+        pid_segments: Dict[SegmentKey, int] = {}
+        current_key: SegmentKey | None = None
         current_shared_huge_kb = 0
         try:
+            _, starttime_before = get_process_identity(pid)
+            if starttime_before != expected_starttime:
+                failed_pid_count += 1
+                continue
+
             with proc.open(pid, "smaps") as f:
                 for line in f:
                     if _is_smaps_mapping_header(line):
-                        if current_key is not None and current_shared_huge_kb > 0:
-                            if segment_sizes.get(current_key, 0) < current_shared_huge_kb:
-                                segment_sizes[current_key] = current_shared_huge_kb
-                            segment_mappers.setdefault(current_key, set()).add(pid)
+                        _record_shared_hugetlb_segment(pid_segments, current_key, current_shared_huge_kb)
                         current_key = _segment_key_from_smaps_header(line)
                         current_shared_huge_kb = 0
                     elif line.startswith("Shared_Hugetlb:"):
                         parts = line.split()
                         if len(parts) >= 2:
                             current_shared_huge_kb = int(parts[1])
-                if current_key is not None and current_shared_huge_kb > 0:
-                    if segment_sizes.get(current_key, 0) < current_shared_huge_kb:
-                        segment_sizes[current_key] = current_shared_huge_kb
-                    segment_mappers.setdefault(current_key, set()).add(pid)
+                _record_shared_hugetlb_segment(pid_segments, current_key, current_shared_huge_kb)
+
+            _, starttime_after = get_process_identity(pid)
         except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
             failed_pid_count += 1
             continue
         except Exception:
             failed_pid_count += 1
             continue
+
+        if starttime_after != expected_starttime:
+            failed_pid_count += 1
+            continue
+
+        for key, size_kb in pid_segments.items():
+            segment_sizes[key] = max(segment_sizes.get(key, 0), size_kb)
+            segment_mappers.setdefault(key, set()).add(pid)
 
     per_cmd_float: Dict[str, float] = {}
     for key, size_kb in segment_sizes.items():
@@ -509,32 +606,38 @@ def get_memory_usage(
     found_readable_pids: set[int] = set()
     found_access_denied_pids: set[int] = set()
     found_missing_runtime_pids: set[int] = set()
+    found_reused_pids: set[int] = set()
     pid_to_cmd_readable: Dict[int, str] = {}
+    pid_starttimes: Dict[int, int] = {}
     shared_hugetlb_candidate_pids: Set[int] = set()
+    pid_filter = set(pids_to_show)
 
     for pid_str in os.listdir(proc.path("")):
         if not pid_str.isdigit():
             continue
         pid = int(pid_str)
 
-        if pids_to_show and pid not in pids_to_show:
+        if pid_filter and pid not in pid_filter:
             continue
         if pid == OUR_PID:
             continue
 
-        # RUN : Si -p est utilise, on respecte les PIDs explicites et on saute
-        # le filtrage TARGET_KEYWORDS.
-        # Sinon, pre-filtrage leger via /proc/<pid>/comm (fallback exe) pour
-        # eviter le cout de get_cmd_name() sur la majorite des processus.
-        if not pids_to_show:
-            if not _matches_target_keywords_fast(pid):
-                continue
         if pids_to_show:
             found_candidate_pids.add(pid)
-        matched_candidates_count += 1
+            matched_candidates_count += 1
 
         try:
+            comm_name, starttime_before = get_process_identity(pid)
+
+            # Sans -p, le nom comm deja lu sert au pre-filtrage (fallback exe).
+            if not pids_to_show:
+                if not _matches_target_keywords_fast(pid, comm_name):
+                    continue
+                matched_candidates_count += 1
+
             private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line = get_mem_stats(pid)
+            cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
+            _, starttime_after = get_process_identity(pid)
         except ProcAccessDenied:
             if pids_to_show:
                 found_access_denied_pids.add(pid)
@@ -549,13 +652,15 @@ def get_memory_usage(
             print(f"[WARN] Failed to read PID {pid}: {e}", file=sys.stderr)
             continue
 
-        # On ne calcule le nom "complet" qu'apres validation du candidat et
-        # lecture memoire reussie.
-        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
+        if starttime_before != starttime_after:
+            found_reused_pids.add(pid)
+            continue
+
         matched_readable_count += 1
         if pids_to_show:
             found_readable_pids.add(pid)
         pid_to_cmd_readable[pid] = cmd
+        pid_starttimes[pid] = starttime_after
         if huge_shared_kb > 0:
             shared_hugetlb_candidate_pids.add(pid)
         pss_seen_any = pss_seen_any or saw_pss_line
@@ -584,6 +689,7 @@ def get_memory_usage(
     if shared_hugetlb_candidate_pids:
         pss_like_shared_hugetlb, failed_pid_count = estimate_shared_hugetlb_pss_like(
             pid_to_cmd=pid_to_cmd_readable,
+            pid_starttimes=pid_starttimes,
             candidate_pids=shared_hugetlb_candidate_pids,
         )
         # max reste une borne basse de securite; on prend la meilleure estimation.
@@ -624,6 +730,7 @@ def get_memory_usage(
         found_readable_pids=found_readable_pids,
         found_access_denied_pids=found_access_denied_pids,
         found_missing_runtime_pids=found_missing_runtime_pids,
+        found_reused_pids=found_reused_pids,
     )
 
 
@@ -658,28 +765,43 @@ def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, tot
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM\n")
 
 
-def _pid_issue_sets(result: MemoryUsageResult, requested_pids: List[int]) -> Tuple[set[int], set[int], set[int], set[int]]:
+def _pid_issue_sets(
+    result: MemoryUsageResult,
+    requested_pids: List[int],
+) -> Tuple[set[int], set[int], set[int], set[int], set[int]]:
     missing_from_proc = set(requested_pids) - result.found_candidate_pids
     access_denied = result.found_access_denied_pids
     disappeared_runtime = result.found_missing_runtime_pids
+    reused = result.found_reused_pids
     unreadable_other = (
         result.found_candidate_pids
         - result.found_readable_pids
         - access_denied
         - disappeared_runtime
+        - reused
     )
-    return missing_from_proc, access_denied, disappeared_runtime, unreadable_other
+    return missing_from_proc, access_denied, disappeared_runtime, reused, unreadable_other
 
 
 def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[int], level: str) -> bool:
-    missing_from_proc, access_denied, disappeared_runtime, unreadable_other = _pid_issue_sets(result, requested_pids)
+    missing_from_proc, access_denied, disappeared_runtime, reused, unreadable_other = _pid_issue_sets(
+        result,
+        requested_pids,
+    )
     emitted = False
     prefix = f"{level}: "
 
     if access_denied:
         print(
-            prefix + "Access denied reading smaps* for PID(s): "
+            prefix + "Access denied reading stat or smaps* for PID(s): "
             f"{', '.join(str(pid) for pid in sorted(access_denied))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if reused:
+        print(
+            prefix + "PID(s) reused during collection (identity changed): "
+            f"{', '.join(str(pid) for pid in sorted(reused))}.",
             file=sys.stderr,
         )
         emitted = True
@@ -699,7 +821,7 @@ def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[in
         emitted = True
     if unreadable_other:
         print(
-            prefix + "Specified PIDs present but unreadable via smaps* (unknown cause): "
+            prefix + "Specified PIDs present but unreadable via stat/smaps* (unknown cause): "
             f"{', '.join(str(pid) for pid in sorted(unreadable_other))}.",
             file=sys.stderr,
         )
@@ -748,12 +870,14 @@ def main() -> None:
                 emitted = _print_pid_issue_messages(result, pids_to_show, level="ERROR")
                 if not emitted:
                     print(
-                        "ERROR: Specified PIDs found but none readable (smaps access/permissions/process exit).",
+                        "ERROR: Specified PIDs found but none readable "
+                        "(stat/smaps access, process exit or PID reuse).",
                         file=sys.stderr,
                     )
             else:
                 print(
-                    "ERROR: Matching processes found but none readable (smaps access/permissions/process exit).",
+                    "ERROR: Matching processes found but none readable "
+                    "(stat/smaps access, process exit or PID reuse).",
                     file=sys.stderr,
                 )
             if watch is None:
@@ -763,7 +887,7 @@ def main() -> None:
 
         # En mode -p, avertir aussi en cas d'erreurs partielles (si au moins un
         # PID est lisible, on continue mais on n'ignore pas silencieusement les
-        # PID refuses/disparus/manquants).
+        # PID refuses/disparus/reutilises/manquants).
         if pids_to_show:
             _print_pid_issue_messages(result, pids_to_show, level="WARN")
 

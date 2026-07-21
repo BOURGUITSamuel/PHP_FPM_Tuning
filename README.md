@@ -23,6 +23,8 @@ Affiche la version du script.
 
 ### `-s, --split-args`
 Sépare l’affichage par arguments complets de ligne de commande.
+Les caractères de contrôle ou non ASCII sont échappés et la commande affichée
+est limitée à 4 096 caractères afin de protéger les terminaux et les journaux.
 
 ### `-t, --total`
 Affiche uniquement le total de mémoire utilisée (RAM).
@@ -39,6 +41,8 @@ Permet de détecter rapidement un serveur qui commence à swaper.
 ### `-p <pid1,pid2,...>`
 Limite l’analyse aux PID spécifiés.
 Utile sans accès root ou pour un diagnostic ciblé.
+Les PID doivent être des entiers décimaux ASCII strictement positifs ; les
+doublons sont ignorés.
 
 ### `-w <N>`
 Rafraîchit l’affichage toutes les `N` secondes (mode surveillance).
@@ -86,6 +90,12 @@ Le script s’appuie sur les informations fournies par le noyau Linux via /proc/
 La valeur RAM used correspond à Private + Shared. La mémoire Private représente la mémoire exclusivement utilisée par le processus et est calculée à partir des champs Private_Clean et Private_Dirty. La mémoire Shared correspond à la part de mémoire partagée réellement imputable au processus et est déterminée par la relation Shared = PSS − Private, ce qui évite toute double comptabilisation.
 
 Les processus PHP-FPM sont regroupés par pool (via le process title php-fpm: pool <site>), offrant une vision mémoire précise par site applicatif. Les valeurs produites sont cohérentes avec des calculs manuels basés sur les champs Pss de smaps_rollup, ce qui rend les résultats directement exploitables pour le dimensionnement des services (PHP-FPM, conteneurs ou autres services applicatifs), là où des outils classiques comme ps ou top montrent leurs limites.
+
+Pour éviter d'associer la mémoire d'un processus au nom d'un autre après une
+réutilisation rapide de PID, le script compare le champ `starttime` de
+`/proc/<pid>/stat` avant et après chaque collecte. Un PID disparu ou réutilisé
+est ignoré ; lorsqu'il a été demandé avec `-p`, un diagnostic explicite est
+écrit sur la sortie d'erreur.
 
 ## Licence
 
