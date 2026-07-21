@@ -138,10 +138,6 @@ class ProcAccessDenied(ProcLookupError):
     pass
 
 
-class ProcInvalidData(ProcLookupError):
-    pass
-
-
 class Proc:
     def __init__(self):
         self.proc = "/proc"
@@ -186,7 +182,6 @@ class MemoryUsageResult:
     found_readable_pids: set[int]
     found_access_denied_pids: set[int]
     found_missing_runtime_pids: set[int]
-    found_reused_pids: set[int]
 
 
 def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
@@ -379,38 +374,16 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
         return f"proc-{pid}"
 
 
-def get_process_identity(pid: int) -> Tuple[str, int]:
-    """Retourne (comm, starttime) depuis /proc/<pid>/stat."""
+def _fast_comm_name(pid: int) -> str:
+    """Nom leger via /proc/<pid>/comm (peu couteux)."""
     try:
-        with proc.open(pid, "stat") as f:
-            stat_line = f.read(MAX_PROC_STAT_CHARS)
-    except ProcLookupError:
-        raise
-    except OSError as e:
-        if e.errno in (errno.ENOENT, errno.ESRCH):
-            raise ProcNotFound(pid, "stat") from e
-        if e.errno in (errno.EPERM, errno.EACCES):
-            raise ProcAccessDenied(pid, "stat") from e
-        raise
-
-    if not stat_line:
-        raise ProcNotFound(pid, "stat")
-
-    comm_start = stat_line.find("(")
-    comm_end = stat_line.rfind(")")
-    if comm_start < 0 or comm_end <= comm_start:
-        raise ProcInvalidData(pid, "stat")
-
-    stat_fields = stat_line[comm_end + 1:].split()
-    if len(stat_fields) <= PROC_STAT_STARTTIME_INDEX:
-        raise ProcInvalidData(pid, "stat")
-
-    try:
-        starttime = int(stat_fields[PROC_STAT_STARTTIME_INDEX])
-    except ValueError as e:
-        raise ProcInvalidData(pid, "stat") from e
-
-    return stat_line[comm_start + 1:comm_end], starttime
+        with proc.open(pid, "comm") as f:
+            comm = f.read().strip().split("\0")[0]
+            if comm:
+                return comm
+    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+        pass
+    return ""
 
 
 def _fast_exe_name(pid: int) -> str:
@@ -426,9 +399,9 @@ def _fast_exe_name(pid: int) -> str:
     return ""
 
 
-def _matches_target_keywords_fast(pid: int, comm_name: str) -> bool:
-    # 1) Nom comm deja lu avec l'identite du processus.
-    comm_name = comm_name.lower()
+def _matches_target_keywords_fast(pid: int) -> bool:
+    # 1) Essai ultra-leger via comm.
+    comm_name = _fast_comm_name(pid).lower()
     if comm_name and any(keyword in comm_name for keyword in TARGET_KEYWORDS):
         return True
 
@@ -606,7 +579,6 @@ def get_memory_usage(
     found_readable_pids: set[int] = set()
     found_access_denied_pids: set[int] = set()
     found_missing_runtime_pids: set[int] = set()
-    found_reused_pids: set[int] = set()
     pid_to_cmd_readable: Dict[int, str] = {}
     pid_starttimes: Dict[int, int] = {}
     shared_hugetlb_candidate_pids: Set[int] = set()
@@ -622,6 +594,13 @@ def get_memory_usage(
         if pid == OUR_PID:
             continue
 
+        # RUN : Si -p est utilise, on respecte les PIDs explicites et on saute
+        # le filtrage TARGET_KEYWORDS.
+        # Sinon, pre-filtrage leger via /proc/<pid>/comm (fallback exe) pour
+        # eviter le cout de get_cmd_name() sur la majorite des processus.
+        if not pids_to_show:
+            if not _matches_target_keywords_fast(pid):
+                continue
         if pids_to_show:
             found_candidate_pids.add(pid)
             matched_candidates_count += 1
@@ -636,8 +615,6 @@ def get_memory_usage(
                 matched_candidates_count += 1
 
             private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line = get_mem_stats(pid)
-            cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
-            _, starttime_after = get_process_identity(pid)
         except ProcAccessDenied:
             if pids_to_show:
                 found_access_denied_pids.add(pid)
@@ -652,10 +629,9 @@ def get_memory_usage(
             print(f"[WARN] Failed to read PID {pid}: {e}", file=sys.stderr)
             continue
 
-        if starttime_before != starttime_after:
-            found_reused_pids.add(pid)
-            continue
-
+        # On ne calcule le nom "complet" qu'apres validation du candidat et
+        # lecture memoire reussie.
+        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
         matched_readable_count += 1
         if pids_to_show:
             found_readable_pids.add(pid)
@@ -730,7 +706,6 @@ def get_memory_usage(
         found_readable_pids=found_readable_pids,
         found_access_denied_pids=found_access_denied_pids,
         found_missing_runtime_pids=found_missing_runtime_pids,
-        found_reused_pids=found_reused_pids,
     )
 
 
@@ -765,43 +740,28 @@ def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, tot
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM\n")
 
 
-def _pid_issue_sets(
-    result: MemoryUsageResult,
-    requested_pids: List[int],
-) -> Tuple[set[int], set[int], set[int], set[int], set[int]]:
+def _pid_issue_sets(result: MemoryUsageResult, requested_pids: List[int]) -> Tuple[set[int], set[int], set[int], set[int]]:
     missing_from_proc = set(requested_pids) - result.found_candidate_pids
     access_denied = result.found_access_denied_pids
     disappeared_runtime = result.found_missing_runtime_pids
-    reused = result.found_reused_pids
     unreadable_other = (
         result.found_candidate_pids
         - result.found_readable_pids
         - access_denied
         - disappeared_runtime
-        - reused
     )
-    return missing_from_proc, access_denied, disappeared_runtime, reused, unreadable_other
+    return missing_from_proc, access_denied, disappeared_runtime, unreadable_other
 
 
 def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[int], level: str) -> bool:
-    missing_from_proc, access_denied, disappeared_runtime, reused, unreadable_other = _pid_issue_sets(
-        result,
-        requested_pids,
-    )
+    missing_from_proc, access_denied, disappeared_runtime, unreadable_other = _pid_issue_sets(result, requested_pids)
     emitted = False
     prefix = f"{level}: "
 
     if access_denied:
         print(
-            prefix + "Access denied reading stat or smaps* for PID(s): "
+            prefix + "Access denied reading smaps* for PID(s): "
             f"{', '.join(str(pid) for pid in sorted(access_denied))}.",
-            file=sys.stderr,
-        )
-        emitted = True
-    if reused:
-        print(
-            prefix + "PID(s) reused during collection (identity changed): "
-            f"{', '.join(str(pid) for pid in sorted(reused))}.",
             file=sys.stderr,
         )
         emitted = True
@@ -821,7 +781,7 @@ def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[in
         emitted = True
     if unreadable_other:
         print(
-            prefix + "Specified PIDs present but unreadable via stat/smaps* (unknown cause): "
+            prefix + "Specified PIDs present but unreadable via smaps* (unknown cause): "
             f"{', '.join(str(pid) for pid in sorted(unreadable_other))}.",
             file=sys.stderr,
         )
@@ -887,7 +847,7 @@ def main() -> None:
 
         # En mode -p, avertir aussi en cas d'erreurs partielles (si au moins un
         # PID est lisible, on continue mais on n'ignore pas silencieusement les
-        # PID refuses/disparus/reutilises/manquants).
+        # PID refuses/disparus/manquants).
         if pids_to_show:
             _print_pid_issue_messages(result, pids_to_show, level="WARN")
 
