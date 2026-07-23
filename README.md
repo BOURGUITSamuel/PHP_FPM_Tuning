@@ -1,108 +1,219 @@
 # ps_mem.py — Analyse mémoire Linux basée sur le PSS
 
-`ps_mem.py` est un script Python conçu pour analyser avec précision la consommation mémoire réelle des processus Linux. Il exploite les informations fournies par le noyau via `/proc/<pid>/smaps` et, lorsque disponible, `/proc/<pid>/smaps_rollup`, afin de s’appuyer sur le **PSS (Proportional Set Size)**. Cette approche permet d’attribuer correctement la mémoire partagée et d’éviter toute double comptabilisation, contrairement aux métriques classiques basées sur le RSS.
+`ps_mem.py` 4.7 estime la mémoire imputable aux processus Linux à partir des
+données du noyau exposées dans `/proc/<pid>/smaps_rollup` ou
+`/proc/<pid>/smaps`. Le calcul utilise prioritairement le **PSS**
+(*Proportional Set Size*) afin de répartir la mémoire partagée et de limiter
+son double comptage.
 
-Le script est particulièrement adapté aux environnements **PHP-FPM multi-pools**, en offrant une vision fiable de la consommation mémoire par programme, par PID ou par pool applicatif. Il constitue ainsi un outil pertinent pour le diagnostic, l’optimisation et le dimensionnement des services applicatifs.
+Le script est orienté vers l’exploitation d’Apache et de PHP-FPM. Il peut
+regrouper les processus par programme, distinguer chaque PID et conserver les
+titres de pools PHP-FPM lorsqu’ils sont exposés par les processus.
 
----
+## Périmètre analysé
+
+Sans option `-p`, le script retient uniquement les processus dont le nom court
+ou le nom de l’exécutable contient l’un des mots-clés suivants :
+`apache`, `httpd`, `php` ou `php-fpm`.
+
+Avec `-p`, ce filtre est désactivé et tout PID accessible peut être analysé.
+Les totaux affichés concernent donc uniquement les processus sélectionnés ;
+ils ne représentent pas la mémoire totale ni le swap total du serveur.
 
 ## Prérequis
 
-- Système Linux avec `/proc` monté
-- Noyau exposant `/proc/<pid>/smaps` (et préférentiellement `/proc/<pid>/smaps_rollup`)
-- Python ≥ 3.10
-- Droits root pour une analyse complète du système
-  (option `-p` utilisable sans privilèges root sur des PID accessibles)
+- Linux avec `/proc` monté ;
+- Python 3.10 ou version ultérieure ;
+- `/proc/<pid>/stat` lisible pour contrôler l’identité du processus ;
+- `/proc/<pid>/smaps_rollup` ou `/proc/<pid>/smaps` lisible pour les processus
+  analysés. Au moins une source de la collecte doit fournir le champ `Pss:`.
 
----
+Le balayage automatique sans `-p` exige les privilèges root. Sans root, il
+faut utiliser `-p` avec des PID dont les entrées `/proc` sont accessibles.
 
-## Options disponibles
+## Options
 
-### `--version`
-Affiche la version du script.
+| Option | Comportement |
+|---|---|
+| `-h`, `--help` | Affiche l’aide et quitte. |
+| `--version` | Affiche la version du script et quitte. |
+| `-s`, `--split-args` | Distingue les processus selon leur ligne de commande complète. Les titres `php-fpm: ...` restent conservés pour le regroupement par pool. |
+| `-t`, `--total` | Affiche uniquement le total RAM. Avec `-S`, affiche uniquement le total du swap. |
+| `-d`, `--discriminate-by-pid` | Ajoute le PID au nom affiché afin de séparer les processus d’un même programme ou pool. |
+| `-S`, `--swap` | Ajoute le swap au tableau. Le script utilise `SwapPss` lorsqu’il est disponible, sinon `Swap`. |
+| `-p <pid1,pid2,...>` | Analyse les PID indiqués et désactive le filtre Apache/PHP. Les PID doivent être des entiers décimaux ASCII strictement positifs ; les doublons sont ignorés. |
+| `-w <N>` | Répète la collecte après chaque intervalle de `N` secondes. `N` doit être un entier strictement positif ; `Ctrl+C` arrête la surveillance. |
 
-### `-s, --split-args`
-Sépare l’affichage par arguments complets de ligne de commande.
-Les caractères de contrôle ou non ASCII sont échappés et la commande affichée
-est limitée à 4 096 caractères afin de protéger les terminaux et les journaux.
-
-### `-t, --total`
-Affiche uniquement le total de mémoire utilisée (RAM).
-Idéal pour les scripts automatisés, la supervision ou le monitoring.
-
-### `-d, --discriminate-by-pid`
-Affiche la consommation mémoire par PID au lieu de regrouper par programme.
-Utile pour le debug avancé (ex. analyse de workers PHP individuels).
-
-### `-S, --swap`
-Affiche la consommation de Swap en plus de la RAM.
-Permet de détecter rapidement un serveur qui commence à swaper.
-
-### `-p <pid1,pid2,...>`
-Limite l’analyse aux PID spécifiés.
-Utile sans accès root ou pour un diagnostic ciblé.
-Les PID doivent être des entiers décimaux ASCII strictement positifs ; les
-doublons sont ignorés.
-
-### `-w <N>`
-Rafraîchit l’affichage toutes les `N` secondes (mode surveillance).
-Idéal pour observer l’évolution mémoire en temps réel.
-
----
+L’intervalle du mode `-w` s’ajoute au temps nécessaire à chaque collecte.
+Les relevés horodatés sont ajoutés à la sortie sans effacer les précédents.
 
 ## Exemples d’utilisation
 
+Les commandes sans `-p` doivent être exécutées avec les privilèges root,
+directement ou avec `sudo`.
+
 ```bash
-# Afficher la version du script
+# Afficher la version et l’aide
 python3 ps_mem.py --version
+python3 ps_mem.py --help
 
-# Affichage standard
-python3 _mem_v4.py
+# Affichage standard des services Apache/PHP ciblés
+sudo python3 ps_mem.py
 
-# Mode surveillance (rafraîchissement toutes les 30 secondes)
-python3 ps_mem.py -w 30
+# Total RAM des processus sélectionnés
+sudo python3 ps_mem.py -t
 
-# Total mémoire uniquement (RAM)
-python3 ps_mem.py -t
+# Détail RAM et swap
+sudo python3 ps_mem.py -S
 
-# Affichage RAM + Swap
-python3 ps_mem.py -S
+# Total du swap uniquement
+sudo python3 ps_mem.py -t -S
 
-# Séparer l'affichage par arguments complets
-python3 ps_mem.py -s
+# Regrouper selon la ligne de commande complète
+sudo python3 ps_mem.py -s
 
-# Consommation mémoire par PID, filtrée sur PHP-FPM
-python3 ps_mem.py -d | grep php-fpm
+# Distinguer chaque processus par PID
+sudo python3 ps_mem.py -d
 
-# Analyse mémoire par pool PHP-FPM
-python3 ps_mem.py | grep 'php-fpm: pool'
+# Surveiller toutes les 30 secondes
+sudo python3 ps_mem.py -w 30
 
-# Analyse ciblée sur des PID spécifiques
+# Analyser des PID spécifiques accessibles
 python3 ps_mem.py -p 1234,5678
 
+# Afficher uniquement les pools PHP-FPM détectés
+sudo python3 ps_mem.py | grep 'php-fpm: pool'
 ```
----
 
-## Interprétation des résultats
+Avant d’utiliser une substitution de commande avec `-p`, vérifier qu’elle a
+retourné au moins un PID. Une valeur vide est volontairement rejetée.
 
-Le script s’appuie sur les informations fournies par le noyau Linux via /proc/<pid>/smaps_rollup, qui expose une vue agrégée et fiable de la consommation mémoire par processus. L’analyse repose prioritairement sur le PSS (Proportional Set Size), représentant la part de mémoire réellement imputable à un processus, incluant une fraction équitable de la mémoire partagée.
+## Sources et calculs mémoire
 
-La valeur RAM used correspond à Private + Shared. La mémoire Private représente la mémoire exclusivement utilisée par le processus et est calculée à partir des champs Private_Clean et Private_Dirty. La mémoire Shared correspond à la part de mémoire partagée réellement imputable au processus et est déterminée par la relation Shared = PSS − Private, ce qui évite toute double comptabilisation.
+Pour chaque PID, le script essaie d’abord d’ouvrir `smaps_rollup`, puis se
+replie sur `smaps` si le premier fichier est absent ou inaccessible. Si aucune
+ligne `Pss:` n’est observée parmi l’ensemble des PID lisibles, le script refuse
+d’afficher les résultats.
 
-Les processus PHP-FPM sont regroupés par pool (via le process title php-fpm: pool <site>), offrant une vision mémoire précise par site applicatif. Les valeurs produites sont cohérentes avec des calculs manuels basés sur les champs Pss de smaps_rollup, ce qui rend les résultats directement exploitables pour le dimensionnement des services (PHP-FPM, conteneurs ou autres services applicatifs), là où des outils classiques comme ps ou top montrent leurs limites.
+Les valeurs reconnues doivent être des entiers décimaux non signés exprimés
+en `kB`. Une ligne malformée pendant la collecte principale entraîne
+l’exclusion du PID. Pendant la passe complémentaire `Shared_Hugetlb`, elle
+provoque seulement l’abandon de l’estimation précise pour ce PID ; les données
+principales restent comptabilisées avec l’heuristique de repli.
 
-Pour éviter d'associer la mémoire d'un processus au nom d'un autre après une
-réutilisation rapide de PID, le script compare le champ `starttime` de
-`/proc/<pid>/stat` avant et après chaque collecte. Un PID disparu ou réutilisé
-est ignoré ; lorsqu'il a été demandé avec `-p`, un diagnostic explicite est
-écrit sur la sortie d'erreur.
+Les valeurs sont regroupées par commande selon les formules suivantes :
+
+```text
+private_base =
+    le champ historique Private s’il est présent,
+    sinon Private_Clean + Private_Dirty
+
+Private =
+    somme(private_base) + somme(Private_Hugetlb)
+
+RAM used =
+    max(
+        somme(Pss)
+        + somme(Private_Hugetlb)
+        + estimation de Shared_Hugetlb,
+        Private
+    )
+
+Shared affiché =
+    RAM used - Private
+```
+
+`Shared` est une valeur dérivée pour l’affichage. Elle ne correspond pas
+directement à `Shared_Clean + Shared_Dirty` et n’est pas toujours égale à
+`PSS - Private`.
+
+### HugeTLB
+
+Les compteurs `Private_Hugetlb` et `Shared_Hugetlb` sont traités séparément,
+car le noyau ne les inclut pas dans les valeurs classiques de PSS et de
+mémoire privée. Pour `Shared_Hugetlb`, le script conserve d’abord le maximum
+observé par groupe, puis tente une seconde lecture de `smaps` afin de
+dédupliquer les segments et d’en calculer une répartition de type PSS.
+
+Le résultat conserve la plus grande valeur entre le maximum initial et cette
+répartition. Cette heuristique limite certains doubles comptages, mais ne
+garantit pas une attribution exacte entre plusieurs groupes de commandes :
+elle peut sous-estimer ou surévaluer `Shared_Hugetlb` selon les mappings
+disponibles. Un avertissement est émis lorsque la passe complémentaire échoue
+pour certains PID.
+
+### Swap
+
+Pour chaque PID, `SwapPss` est utilisé lorsqu’il est disponible ; sinon le
+script utilise `Swap`. Ce repli est moins précis pour les pages de swap
+partagées et doit être considéré comme une approximation.
+
+Avec `-S`, le tableau contient la RAM et le swap. Avec `-t -S`, seule la somme
+du swap des processus sélectionnés est écrite.
+
+## Regroupement PHP-FPM
+
+Le script conserve un titre commençant par `php-fpm:` tel que
+`php-fpm: pool exemple`, puis regroupe les titres identiques. Ce comportement
+dépend du titre réellement exposé par PHP-FPM ; le script ne lit pas la
+configuration des pools et un pool ne correspond pas nécessairement à un
+site.
+
+L’option `-s` préserve ces titres. L’option `-d` ajoute le PID et sépare donc
+les processus de travail.
+
+## Sécurité et robustesse
+
+- Les noms de commande sont échappés avant affichage et limités à
+  4 096 caractères dans tous les modes.
+- Le champ `starttime` de `/proc/<pid>/stat` est comparé avant et après la
+  collecte afin d’ignorer les PID disparus ou réutilisés.
+- Les valeurs mémoire malformées, négatives ou exprimées dans une autre unité
+  que `kB` sont rejetées.
+- Les erreurs système inattendues et les erreurs de programmation ne sont pas
+  masquées.
+- Le script lit `/proc` sans modifier les processus analysés.
+
+Les erreurs attendues restent limitées au PID concerné. Avec `-p`, les PID
+refusés, disparus, réutilisés ou invalides sont signalés sur `stderr` lorsque
+la collecte peut continuer. Les résultats peuvent donc être partiels si
+certains PID ne sont pas lisibles.
+
+## Sorties et codes de retour
+
+Chaque collecte commence par un horodatage. Lorsque la sortie standard
+(`stdout`) est redirigée, l’horodatage est envoyé sur `stderr`, ce qui permet
+notamment à `-t` de conserver une valeur unique sur `stdout`.
+
+| Code | Signification |
+|---:|---|
+| `0` | Exécution terminée avec succès, ou aucun processus correspondant. |
+| `1` | Privilèges root absents lors d’une exécution sans `-p`. |
+| `2` | Arguments invalides, candidats présents mais tous illisibles, ou PSS indisponible. |
+
+Une erreur système inattendue ou une erreur de programmation interrompt le
+script avec un code non nul. En mode `-w`, les absences temporaires, les
+problèmes de lecture récupérables et l’absence de PSS provoquent une nouvelle
+tentative après l’intervalle demandé.
+
+## Limites connues
+
+- Les résultats constituent un instantané et peuvent évoluer immédiatement
+  après la collecte.
+- Le repli vers `smaps` peut être plus coûteux que `smaps_rollup` sur un
+  processus possédant beaucoup de mappings.
+- L’heuristique `Shared_Hugetlb` peut sous-estimer ou surévaluer l’attribution
+  entre groupes de commandes.
+- Le regroupement PHP-FPM dépend des titres réellement publiés par les
+  processus.
+- Les totaux restent limités au périmètre sélectionné.
 
 ## Licence
 
-GNU Lesser General Public License v2.1 (LGPL-2.1)
+Ce projet est distribué sous la
+[GNU Lesser General Public License version 2.1 ou ultérieure](LICENSE.txt)
+(`LGPL-2.1-or-later`).
 
-Ce projet est une version modifiée, enrichie et modernisée de **ps_mem**
-écrit à l’origine par Pádraig Brady.
-https://github.com/pixelb/ps_mem
-
----
+Il s’agit d’une version modifiée et modernisée de
+[`ps_mem`](https://github.com/pixelb/ps_mem), écrit à l’origine par
+Pádraig Brady.

@@ -1,2 +1,11 @@
+# Cache et fichiers compilés Python
 __pycache__/
 *.py[cod]
+
+# Environnement virtuel local
+/.venv/
+
+# Fichiers générés par le système d'exploitation
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,65 +1,21 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
-ps_mem.py — Analyse optimisée de l’usage mémoire sous Linux (Ubuntu)
+Estime la mémoire imputable aux processus Linux à partir du PSS.
 
-Auteur : jsbourguit (script original de Pádraig Brady)
-Version : 4.6
-Compatibilité : Python >= 3.10
-Licence : LGPLv2
+Sans -p, l'analyse se limite aux processus dont le nom court ou celui de
+l'exécutable contient apache, httpd, php ou php-fpm. Avec -p, tout PID
+accessible peut être ciblé. Les résultats sont regroupés par programme et
+les titres PHP-FPM sont conservés afin de distinguer les pools.
 
-Description :
-    Outil d’analyse permettant d’afficher la consommation mémoire réelle
-    des processus Linux, regroupée par programme, par PID ou par pool PHP-FPM
-    selon les options utilisées.
-    Le calcul repose sur les informations fournies par /proc/<pid>/smaps*
-    (prioritairement smaps_rollup lorsqu’il est disponible), en s’appuyant
-    sur le PSS (Proportional Set Size) afin d’obtenir une estimation fiable
-    de la RAM réellement consommée par les processus.
-    L’agrégation est totalisable lorsque le PSS est disponible, garantissant
-    des résultats cohérents en environnement de production.
+Les mesures sont lues dans /proc/<pid>/smaps_rollup, avec repli sur smaps.
+La mémoire HugeTLB est traitée séparément. La part Shared_Hugetlb repose sur
+une heuristique et peut donc être sous-estimée ou surévaluée.
 
-Améliorations de cette version :
-    - Alignement sur la logique du script ps_mem original :
-        la colonne « RAM used » correspond à Private + Shared, avec
-        une utilisation préférentielle du champ Pss lorsque le kernel
-        le fournit, garantissant un total cohérent et exploitable.
+Les totaux concernent uniquement les processus sélectionnés.
 
-    - Optimisation du calcul mémoire :
-        agrégation contrôlée des HugePages (Private_Hugetlb / Shared_Hugetlb)
-        afin d’éviter tout double comptage et sous-estimation.
-
-    - Support explicite et correct de smaps_rollup :
-        lecture directe des champs Pss, Private_* et HugeTLB associe,
-        réduisant la charge CPU et améliorant les performances
-        sur serveurs à forte volumétrie de processus.
-
-    - Regroupement fiable des processus PHP-FPM par pool / site :
-        les intitulés de type « php-fpm: pool <site> » sont conservés
-        tels quels afin de fournir une vue mémoire par site applicatif,
-        ce qui n’est pas possible avec les outils standards (ps, top).
-
-    - Filtrage intelligent des processus cibles :
-        limitation optionnelle à certains services (apache, httpd, php, php-fpm)
-        pour une analyse orientée exploitation web.
-
-    - Gestion robuste des processus éphémères :
-        l'identité issue de /proc/<pid>/stat est contrôlée avant et après
-        la collecte pour ignorer les PID disparus ou réutilisés.
-
-    - Clarification du comportement des options :
-        l’option -t -S affiche exclusivement le total du Swap,
-        avec utilisation prioritaire de SwapPss lorsque disponible.
-
-    - Meilleure gestion des permissions :
-        distinction explicite entre PID inexistants, non lisibles
-        et accès refusés à smaps, avec messages d’erreur clairs.
-
-    - Code modernisé et documenté :
-        annotations de types, commentaires explicatifs et
-        structure lisible facilitant la maintenance et l’évolution
-        future du script.
+Adaptation : jsbourguit, à partir du script original de Pádraig Brady.
+Licence : LGPL-2.1-or-later.
 """
 
 import argparse
@@ -68,21 +24,36 @@ import errno
 import os
 import sys
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, NoReturn, Set, Tuple
 
-__version__ = "4.6"
+__version__ = "4.7"
 
 OUR_PID = os.getpid()
 
 TARGET_KEYWORDS = ("apache", "httpd", "php", "php-fpm")
 MAX_COMMAND_CHARS = 4096
 MAX_PROC_STAT_CHARS = 4096
-PROC_STAT_STARTTIME_INDEX = 22 - 3  # Champs 3+ après la parenthèse de comm.
+PROC_STAT_STARTTIME_INDEX = 22 - 3  # stat_fields commence au champ 3 de /proc/<pid>/stat.
 
 SegmentKey = Tuple[str, str, str, str, int]
+PROC_NOT_FOUND_ERRNOS = frozenset((errno.ENOENT, errno.ESRCH))
+PROC_ACCESS_DENIED_ERRNOS = frozenset((errno.EPERM, errno.EACCES))
+SMAPS_FIELDS = frozenset(
+    (
+        "Private",
+        "Private_Clean",
+        "Private_Dirty",
+        "Pss",
+        "Swap",
+        "SwapPss",
+        "Private_Hugetlb",
+        "Shared_Hugetlb",
+    )
+)
 
 
 def std_exceptions(exc_type, value, tb):
+    """Ignore les interruptions normales et délègue les autres exceptions à Python."""
     sys.excepthook = sys.__excepthook__
     if issubclass(exc_type, (KeyboardInterrupt, BrokenPipeError)):
         return
@@ -94,37 +65,39 @@ sys.excepthook = std_exceptions
 
 class Unbuffered:
     def __init__(self, stream):
+        """Associe le wrapper au flux à vider après chaque écriture."""
         self.stream = stream
 
     def write(self, data: str) -> None:
+        """Écrit les données puis vide immédiatement le tampon du flux."""
         self.stream.write(data)
         self.stream.flush()
 
     def flush(self) -> None:
+        """Vide le tampon sans propager les erreurs attendues d'un flux fermé."""
         try:
             self.stream.flush()
-        except Exception:
+        except (BrokenPipeError, ValueError):
             pass
 
     def isatty(self) -> bool:
+        """Indique si le flux est relié à un terminal encore utilisable."""
         try:
             return self.stream.isatty()
-        except Exception:
+        except (OSError, ValueError):
             return False
 
     def close(self) -> None:
-        try:
-            self.stream.flush()
-        except Exception:
-            pass
+        """Ferme le flux sans propager les erreurs de fermeture attendues."""
         try:
             self.stream.close()
-        except Exception:
+        except (BrokenPipeError, ValueError):
             pass
 
 
 class ProcLookupError(LookupError):
     def __init__(self, pid: int, entry: str):
+        """Mémorise le PID et l'entrée /proc à l'origine de l'erreur."""
         self.pid = pid
         self.entry = entry
         super().__init__(f"/proc/{pid}/{entry}" if entry else f"/proc/{pid}")
@@ -138,14 +111,51 @@ class ProcAccessDenied(ProcLookupError):
     pass
 
 
+class ProcInvalidData(ProcLookupError):
+    pass
+
+
+def _parse_smaps_kb_value(pid: int, entry: str, value_and_unit: str) -> int:
+    """Valide puis convertit une valeur smaps de la forme « <nombre> kB »."""
+    parts = value_and_unit.split()
+    if len(parts) != 2 or parts[1] != "kB":
+        raise ProcInvalidData(pid, entry)
+
+    value_text = parts[0]
+    if not value_text.isascii() or not value_text.isdecimal():
+        raise ProcInvalidData(pid, entry)
+
+    try:
+        return int(value_text, 10)
+    except ValueError as e:
+        raise ProcInvalidData(pid, entry) from e
+
+
+def _raise_proc_os_error(pid: int, entry: str, error: OSError) -> NoReturn:
+    """Traduit les erreurs /proc attendues et propage les autres."""
+    if error.errno in PROC_NOT_FOUND_ERRNOS:
+        raise ProcNotFound(pid, entry) from error
+    if error.errno in PROC_ACCESS_DENIED_ERRNOS:
+        raise ProcAccessDenied(pid, entry) from error
+    raise error
+
+
+def _is_expected_proc_os_error(error: OSError) -> bool:
+    """Reconnaît une erreur due à un PID absent ou inaccessible."""
+    return error.errno in PROC_NOT_FOUND_ERRNOS or error.errno in PROC_ACCESS_DENIED_ERRNOS
+
+
 class Proc:
     def __init__(self):
+        """Définit la racine utilisée pour lire les informations des processus."""
         self.proc = "/proc"
 
     def path(self, *args: str | int) -> str:
+        """Construit un chemin sous /proc à partir de ses composants."""
         return os.path.join(self.proc, *(str(a) for a in args))
 
     def open(self, *args: str | int):
+        """Ouvre une entrée /proc en traduisant les erreurs liées au PID."""
         try:
             return open(
                 self.path(*args),
@@ -157,14 +167,32 @@ class Proc:
             if args and isinstance(args[0], int):
                 pid = int(args[0])
                 entry = "/".join(str(a) for a in args[1:])
-                if e.errno in (errno.ENOENT, errno.ESRCH):
-                    raise ProcNotFound(pid, entry) from e
-                if e.errno in (errno.EPERM, errno.EACCES):
-                    raise ProcAccessDenied(pid, entry) from e
+                _raise_proc_os_error(pid, entry, e)
+            raise
+
+    def readlink(self, *args: str | int) -> str:
+        """Lit un lien /proc en traduisant les erreurs liées au PID."""
+        try:
+            return os.readlink(self.path(*args))
+        except OSError as e:
+            if args and isinstance(args[0], int):
+                pid = int(args[0])
+                entry = "/".join(str(a) for a in args[1:])
+                _raise_proc_os_error(pid, entry, e)
             raise
 
 
 proc = Proc()
+
+
+@dataclass
+class CommandUsage:
+    pss_kb: int = 0
+    private_base_kb: int = 0
+    huge_private_kb: int = 0
+    huge_shared_kb: int = 0
+    swap_kb: int = 0
+    count: int = 0
 
 
 @dataclass
@@ -182,17 +210,52 @@ class MemoryUsageResult:
     found_readable_pids: set[int]
     found_access_denied_pids: set[int]
     found_missing_runtime_pids: set[int]
+    found_reused_pids: set[int]
+    found_invalid_data_pids: set[int]
 
 
 def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
-    parser = argparse.ArgumentParser(description="Show per-program (and PHP-FPM pool) memory usage (PSS based).")
+    """Analyse et valide les options de la ligne de commande."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show PSS-based memory usage for Apache/HTTPd/PHP processes, "
+            "grouped by program or PHP-FPM pool. Use -p to select specific PIDs."
+        )
+    )
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("-s", "--split-args", action="store_true", help="Separate by full command line (not used for pools).")
-    parser.add_argument("-t", "--total", dest="only_total", action="store_true", help="Show only total memory.")
-    parser.add_argument("-d", "--discriminate-by-pid", action="store_true", help="Show by process instead of program.")
-    parser.add_argument("-S", "--swap", dest="show_swap", action="store_true", help="Show swap usage (SwapPss if available).")
-    parser.add_argument("-p", dest="pids", metavar="<pid>[,pid2,...]", help="Filter by PIDs.")
-    parser.add_argument("-w", dest="watch", metavar="<N>", type=int, help="Refresh every N seconds.")
+    parser.add_argument(
+        "-s",
+        "--split-args",
+        action="store_true",
+        help="Use the full command line as the label (PHP-FPM pool titles are preserved).",
+    )
+    parser.add_argument(
+        "-t",
+        "--total",
+        dest="only_total",
+        action="store_true",
+        help="Show only the RAM total, or the swap total when combined with -S.",
+    )
+    parser.add_argument(
+        "-d",
+        "--discriminate-by-pid",
+        action="store_true",
+        help="Keep each PID separate instead of grouping by program.",
+    )
+    parser.add_argument(
+        "-S",
+        "--swap",
+        dest="show_swap",
+        action="store_true",
+        help="Show swap usage (SwapPss if available).",
+    )
+    parser.add_argument(
+        "-p",
+        dest="pids",
+        metavar="<pid>[,pid2,...]",
+        help="Analyze only the listed PIDs; bypasses the default name filter.",
+    )
+    parser.add_argument("-w", dest="watch", metavar="<N>", type=int, help="Repeat the collection after N seconds.")
     args = parser.parse_args()
 
     pids_to_show: List[int] = []
@@ -209,31 +272,20 @@ def parse_options() -> Tuple[bool, List[int], int | None, bool, bool, bool]:
             parser.error("PIDs must be positive integers separated by commas.")
 
     if args.watch is not None and args.watch <= 0:
-        parser.error("Seconds must be positive!")
+        parser.error("Refresh interval must be a positive integer.")
 
     return args.split_args, pids_to_show, args.watch, args.only_total, args.discriminate_by_pid, args.show_swap
 
 
 def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
+    """Lit les compteurs mémoire du PID.
+
+    Retourne en KiB la mémoire privée hors HugeTLB, le PSS, le swap, la part
+    HugeTLB privée, la part HugeTLB partagée, puis la présence du champ Pss.
+    SwapPss est utilisé lorsqu'il est disponible, sinon Swap.
     """
-    Retourne (private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line)
-    - private_base_kb: somme des Private_Clean/Private_Dirty (rollup) OU Private: (smaps)
-    - pss_kb: somme des Pss:
-    - swap_kb: SwapPss si dispo, sinon Swap
-    - huge_priv_kb: Private_Hugetlb
-    - huge_shared_kb: Shared_Hugetlb
-    """
-    private_base_kb = 0
-    private_cd_kb = 0
-    saw_private_total = False
-    pss_kb = 0
-    swap_kb = 0
-    swap_sum_kb = 0
-    swappss_sum_kb = 0
-    huge_priv_kb = 0
-    huge_shared_kb = 0
-    saw_pss_line = False
-    saw_swappss_line = False
+    totals = {field: 0 for field in SMAPS_FIELDS}
+    seen_fields: Set[str] = set()
 
     smaps_handle = None
     smaps_file_used = ""
@@ -244,84 +296,58 @@ def get_mem_stats(pid: int) -> Tuple[int, int, int, int, int, bool]:
             smaps_file_used = smaps_file
             break
         except ProcAccessDenied as e:
-            # Cause prioritaire si aucun fallback lisible n'est possible.
+            # Un refus d'accès reste l'erreur la plus utile si les deux lectures échouent.
             last_lookup_error = e
             continue
         except ProcNotFound as e:
             if last_lookup_error is None:
                 last_lookup_error = e
             continue
-        except (FileNotFoundError, ProcessLookupError, OSError):
-            continue
 
     if smaps_handle is None:
         if last_lookup_error is not None:
             raise last_lookup_error
-        raise LookupError
+        raise ProcNotFound(pid, "smaps*")
 
     try:
         with smaps_handle as f:
             for line in f:
-                # Private (rollup: Private_Clean/Dirty, smaps: Private:)
-                if line.startswith("Private:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        private_base_kb += int(parts[1])
-                        saw_private_total = True
-                elif line.startswith(("Private_Clean:", "Private_Dirty:")):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        private_cd_kb += int(parts[1])
+                field, separator, value_and_unit = line.partition(":")
+                if not separator or field not in SMAPS_FIELDS:
+                    continue
 
-                # HugeTLB (hugetlbfs) est historiquement exclu de RSS/PSS,
-                # donc on le traite a part pour eviter de sous-compter.
-                elif line.startswith("Private_Hugetlb:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        huge_priv_kb += int(parts[1])
-                elif line.startswith("Shared_Hugetlb:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        huge_shared_kb += int(parts[1])
-
-                # PSS
-                elif line.startswith("Pss:"):
-                    saw_pss_line = True
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        pss_kb += int(parts[1])
-
-                # Swap
-                elif line.startswith("SwapPss:"):
-                    saw_swappss_line = True
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        swappss_sum_kb += int(parts[1])
-
-                elif line.startswith("Swap:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        swap_sum_kb += int(parts[1])
-    except ProcLookupError:
-        raise
+                totals[field] += _parse_smaps_kb_value(
+                    pid,
+                    smaps_file_used or "smaps*",
+                    value_and_unit,
+                )
+                # La présence du champ compte, même si sa valeur est nulle.
+                if field in ("Private", "Pss", "SwapPss"):
+                    seen_fields.add(field)
     except OSError as e:
-        if e.errno in (errno.ENOENT, errno.ESRCH):
-            raise ProcNotFound(pid, smaps_file_used or "smaps*") from e
-        if e.errno in (errno.EPERM, errno.EACCES):
-            raise ProcAccessDenied(pid, smaps_file_used or "smaps*") from e
-        raise LookupError
+        _raise_proc_os_error(pid, smaps_file_used or "smaps*", e)
 
-    if not saw_private_total:
-        private_base_kb = private_cd_kb
-
-    swap_kb = swappss_sum_kb if saw_swappss_line else swap_sum_kb
-    return private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line
+    private_base_kb = (
+        totals["Private"]
+        if "Private" in seen_fields
+        else totals["Private_Clean"] + totals["Private_Dirty"]
+    )
+    swap_kb = totals["SwapPss"] if "SwapPss" in seen_fields else totals["Swap"]
+    return (
+        private_base_kb,
+        totals["Pss"],
+        swap_kb,
+        totals["Private_Hugetlb"],
+        totals["Shared_Hugetlb"],
+        "Pss" in seen_fields,
+    )
 
 
 def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool = False) -> str:
-    """
-    Conserve le titre PHP-FPM (pool) si présent.
-    Sinon, retombe sur l'exécutable.
+    """Construit le libellé utilisé pour l'affichage et le regroupement.
+
+    Les titres PHP-FPM sont conservés. Pour les autres processus, split_args
+    utilise la ligne de commande complète et discriminate_by_pid ajoute le PID.
     """
     try:
         with proc.open(pid, "cmdline") as f:
@@ -339,7 +365,6 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
                 cmdline0 = parts[0]
                 cmdline_full = " ".join(parts)
 
-        # PHP-FPM: on garde le title complet pour regrouper par pool
         if cmdline0.startswith("php-fpm:"):
             cmd = cmdline0
             command_was_truncated = first_arg_truncated
@@ -349,7 +374,7 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
         else:
             command_was_truncated = False
             try:
-                exe_target = os.readlink(proc.path(pid, "exe"))
+                exe_target = proc.readlink(pid, "exe")
                 exe_target = exe_target.split("\0")[0]
                 if exe_target:
                     cmd = os.path.basename(exe_target)
@@ -358,7 +383,7 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
                     command_was_truncated = first_arg_truncated
                 else:
                     cmd = f"proc-{pid}"
-            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            except ProcLookupError:
                 cmd = os.path.basename(cmdline0) if cmdline0 else f"proc-{pid}"
                 command_was_truncated = bool(cmdline0) and first_arg_truncated
 
@@ -368,44 +393,62 @@ def get_cmd_name(pid: int, split_args: bool = False, discriminate_by_pid: bool =
             cmd = f"{cmd} [{pid}]"
         return cmd
 
-    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+    except ProcLookupError:
         return f"proc-{pid}"
-    except Exception:
-        return f"proc-{pid}"
+    except OSError as e:
+        if _is_expected_proc_os_error(e):
+            return f"proc-{pid}"
+        raise
 
 
-def _fast_comm_name(pid: int) -> str:
-    """Nom leger via /proc/<pid>/comm (peu couteux)."""
+def get_process_identity(pid: int) -> Tuple[str, int]:
+    """Lit le nom (comm) et le champ starttime dans /proc/<pid>/stat."""
     try:
-        with proc.open(pid, "comm") as f:
-            comm = f.read().strip().split("\0")[0]
-            if comm:
-                return comm
-    except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
-        pass
-    return ""
+        with proc.open(pid, "stat") as f:
+            stat_line = f.read(MAX_PROC_STAT_CHARS)
+    except OSError as e:
+        _raise_proc_os_error(pid, "stat", e)
+
+    if not stat_line:
+        raise ProcNotFound(pid, "stat")
+
+    comm_start = stat_line.find("(")
+    comm_end = stat_line.rfind(")")
+    if comm_start < 0 or comm_end <= comm_start:
+        raise ProcInvalidData(pid, "stat")
+
+    stat_fields = stat_line[comm_end + 1:].split()
+    if len(stat_fields) <= PROC_STAT_STARTTIME_INDEX:
+        raise ProcInvalidData(pid, "stat")
+
+    try:
+        starttime = int(stat_fields[PROC_STAT_STARTTIME_INDEX])
+    except ValueError as e:
+        raise ProcInvalidData(pid, "stat") from e
+
+    return stat_line[comm_start + 1:comm_end], starttime
 
 
 def _fast_exe_name(pid: int) -> str:
-    """Nom de binaire via basename(/proc/<pid>/exe)."""
+    """Retourne le nom du binaire pointé par /proc/<pid>/exe s'il est lisible."""
     try:
-        exe_target = os.readlink(proc.path(pid, "exe"))
+        exe_target = proc.readlink(pid, "exe")
         exe_target = exe_target.split("\0")[0]
         if exe_target:
             return os.path.basename(exe_target)
-    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+    except ProcLookupError:
         pass
 
     return ""
 
 
-def _matches_target_keywords_fast(pid: int) -> bool:
-    # 1) Essai ultra-leger via comm.
-    comm_name = _fast_comm_name(pid).lower()
+def _matches_target_keywords_fast(pid: int, comm_name: str) -> bool:
+    """Vérifie si le PID appartient au périmètre Apache/PHP par défaut."""
+    comm_name = comm_name.lower()
     if comm_name and any(keyword in comm_name for keyword in TARGET_KEYWORDS):
         return True
 
-    # 2) Fallback sur basename de l'exe, utile si comm est tronque.
+    # comm peut être tronqué par le noyau ; vérifier aussi le nom de l'exécutable.
     exe_name = _fast_exe_name(pid).lower()
     if exe_name and any(keyword in exe_name for keyword in TARGET_KEYWORDS):
         return True
@@ -414,6 +457,7 @@ def _matches_target_keywords_fast(pid: int) -> bool:
 
 
 def human(kb: float) -> str:
+    """Formate une quantité en KiB avec l'unité binaire adaptée."""
     units = ["KiB", "MiB", "GiB", "TiB"]
     v = float(kb)
     for u in units:
@@ -424,7 +468,7 @@ def human(kb: float) -> str:
 
 
 def safe_command_text(command: str) -> str:
-    """Retourne une représentation ASCII sûre et bornée pour l'affichage."""
+    """Échappe les caractères non ASCII ou de contrôle et limite la longueur affichée."""
     safe_command = ascii(command)[1:-1]
     if len(safe_command) > MAX_COMMAND_CHARS:
         safe_command = f"{safe_command[:MAX_COMMAND_CHARS - 3]}..."
@@ -432,11 +476,13 @@ def safe_command_text(command: str) -> str:
 
 
 def cmd_with_count(cmd: str, count: int) -> str:
+    """Ajoute le nombre de processus lorsqu'un même libellé est regroupé."""
     safe_cmd = safe_command_text(cmd)
     return f"{safe_cmd} ({count})" if count > 1 else safe_cmd
 
 
 def _is_smaps_mapping_header(line: str) -> bool:
+    """Indique si une ligne marque le début d'un mapping dans smaps."""
     parts = line.split(None, 5)
     if len(parts) < 5:
         return False
@@ -444,21 +490,15 @@ def _is_smaps_mapping_header(line: str) -> bool:
 
 
 def _segment_key_from_smaps_header(line: str) -> SegmentKey:
-    """
-    Cle stable inter-process pour approximer un segment partage :
-    (dev, inode, offset, pathname, mapping_len_kb)
-    """
+    """Construit la clé utilisée pour reconnaître un mapping entre processus."""
     parts = line.strip().split(None, 5)
     addr = parts[0]
     offset = parts[2]
     dev = parts[3]
     inode = parts[4]
     pathname = parts[5] if len(parts) >= 6 else ""
-    try:
-        start_hex, end_hex = addr.split("-", 1)
-        mapping_len_kb = max(0, (int(end_hex, 16) - int(start_hex, 16)) // 1024)
-    except Exception:
-        mapping_len_kb = 0
+    start_hex, end_hex = addr.split("-", 1)
+    mapping_len_kb = max(0, (int(end_hex, 16) - int(start_hex, 16)) // 1024)
     return dev, inode, offset, pathname, mapping_len_kb
 
 
@@ -467,6 +507,7 @@ def _record_shared_hugetlb_segment(
     key: SegmentKey | None,
     size_kb: int,
 ) -> None:
+    """Conserve la plus grande valeur Shared_Hugetlb observée pour un mapping."""
     if key is not None and size_kb > segments.get(key, 0):
         segments[key] = size_kb
 
@@ -476,14 +517,13 @@ def estimate_shared_hugetlb_pss_like(
     pid_starttimes: Dict[int, int],
     candidate_pids: Set[int],
 ) -> Tuple[Dict[str, int], int]:
-    """
-    Estime Shared_Hugetlb par commande via une repartition "pss-like":
-    - lecture de /proc/<pid>/smaps pour les seuls PID candidats
-    - validation de l'identite du PID avant et apres chaque lecture
-    - deduplication des segments partages via cle de segment
-    - repartition de chaque segment selon le nb de mappeurs par commande
+    """Répartit approximativement Shared_Hugetlb entre les commandes.
 
-    Retourne ({cmd: kb}, failed_pid_count).
+    Les mappings sont dédupliqués, puis chaque segment est réparti entre les
+    processus qui le référencent. Les PID devenus illisibles ou dont l'identité
+    change pendant la lecture sont écartés.
+
+    Retourne les valeurs par commande et le nombre de PID écartés.
     """
     segment_sizes: Dict[SegmentKey, int] = {}
     segment_mappers: Dict[SegmentKey, Set[int]] = {}
@@ -511,16 +551,20 @@ def estimate_shared_hugetlb_pss_like(
                         current_key = _segment_key_from_smaps_header(line)
                         current_shared_huge_kb = 0
                     elif line.startswith("Shared_Hugetlb:"):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            current_shared_huge_kb = int(parts[1])
+                        current_shared_huge_kb = _parse_smaps_kb_value(
+                            pid,
+                            "smaps",
+                            line.partition(":")[2],
+                        )
                 _record_shared_hugetlb_segment(pid_segments, current_key, current_shared_huge_kb)
 
             _, starttime_after = get_process_identity(pid)
-        except (LookupError, FileNotFoundError, ProcessLookupError, OSError):
+        except (ProcLookupError, ValueError):
             failed_pid_count += 1
             continue
-        except Exception:
+        except OSError as e:
+            if not _is_expected_proc_os_error(e):
+                raise
             failed_pid_count += 1
             continue
 
@@ -561,17 +605,8 @@ def get_memory_usage(
     split_args: bool,
     discriminate_by_pid: bool,
 ) -> MemoryUsageResult:
-    """
-    Retourne une structure agregee de consommation memoire.
-    """
-    psses: Dict[str, int] = {}
-    private_bases: Dict[str, int] = {}
-    huge_privs: Dict[str, int] = {}
-    huge_shareds: Dict[str, int] = {}
-    privates: Dict[str, int] = {}
-    ram_useds: Dict[str, int] = {}
-    counts: Dict[str, int] = {}
-    swaps: Dict[str, int] = {}
+    """Collecte les PID retenus et agrège leurs mesures par libellé."""
+    usage_by_cmd: Dict[str, CommandUsage] = {}
     matched_candidates_count = 0
     matched_readable_count = 0
     pss_seen_any = False
@@ -579,6 +614,8 @@ def get_memory_usage(
     found_readable_pids: set[int] = set()
     found_access_denied_pids: set[int] = set()
     found_missing_runtime_pids: set[int] = set()
+    found_reused_pids: set[int] = set()
+    found_invalid_data_pids: set[int] = set()
     pid_to_cmd_readable: Dict[int, str] = {}
     pid_starttimes: Dict[int, int] = {}
     shared_hugetlb_candidate_pids: Set[int] = set()
@@ -594,13 +631,6 @@ def get_memory_usage(
         if pid == OUR_PID:
             continue
 
-        # RUN : Si -p est utilise, on respecte les PIDs explicites et on saute
-        # le filtrage TARGET_KEYWORDS.
-        # Sinon, pre-filtrage leger via /proc/<pid>/comm (fallback exe) pour
-        # eviter le cout de get_cmd_name() sur la majorite des processus.
-        if not pids_to_show:
-            if not _matches_target_keywords_fast(pid):
-                continue
         if pids_to_show:
             found_candidate_pids.add(pid)
             matched_candidates_count += 1
@@ -608,13 +638,15 @@ def get_memory_usage(
         try:
             comm_name, starttime_before = get_process_identity(pid)
 
-            # Sans -p, le nom comm deja lu sert au pre-filtrage (fallback exe).
             if not pids_to_show:
+                # Éviter la lecture coûteuse de smaps pour les processus hors périmètre.
                 if not _matches_target_keywords_fast(pid, comm_name):
                     continue
                 matched_candidates_count += 1
 
             private_base_kb, pss_kb, swap_kb, huge_priv_kb, huge_shared_kb, saw_pss_line = get_mem_stats(pid)
+            cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
+            _, starttime_after = get_process_identity(pid)
         except ProcAccessDenied:
             if pids_to_show:
                 found_access_denied_pids.add(pid)
@@ -623,15 +655,17 @@ def get_memory_usage(
             if pids_to_show:
                 found_missing_runtime_pids.add(pid)
             continue
-        except LookupError:
-            continue
-        except Exception as e:
-            print(f"[WARN] Failed to read PID {pid}: {e}", file=sys.stderr)
+        except ProcInvalidData as e:
+            if pids_to_show:
+                found_invalid_data_pids.add(pid)
+            else:
+                print(f"[WARN] Invalid data in {e}; PID skipped.", file=sys.stderr)
             continue
 
-        # On ne calcule le nom "complet" qu'apres validation du candidat et
-        # lecture memoire reussie.
-        cmd = get_cmd_name(pid, split_args, discriminate_by_pid)
+        if starttime_before != starttime_after:
+            found_reused_pids.add(pid)
+            continue
+
         matched_readable_count += 1
         if pids_to_show:
             found_readable_pids.add(pid)
@@ -641,26 +675,19 @@ def get_memory_usage(
             shared_hugetlb_candidate_pids.add(pid)
         pss_seen_any = pss_seen_any or saw_pss_line
 
-        # PSS totalisable : somme directe
-        psses[cmd] = psses.get(cmd, 0) + pss_kb
-
-        # Private base totalisable : somme directe (hors huge)
-        private_bases[cmd] = private_bases.get(cmd, 0) + private_base_kb
-
-        # Huge private totalisable : somme directe
-        huge_privs[cmd] = huge_privs.get(cmd, 0) + huge_priv_kb
-
-        # Huge shared : aggregation par MAX pour eviter le double comptage
-        if cmd in huge_shareds:
-            if huge_shareds[cmd] < huge_shared_kb:
-                huge_shareds[cmd] = huge_shared_kb
+        usage = usage_by_cmd.get(cmd)
+        if usage is None:
+            usage = CommandUsage(huge_shared_kb=huge_shared_kb)
+            usage_by_cmd[cmd] = usage
         else:
-            huge_shareds[cmd] = huge_shared_kb
+            # Repli : conserver la plus grande valeur partagée observée dans le groupe.
+            usage.huge_shared_kb = max(usage.huge_shared_kb, huge_shared_kb)
 
-        # Swap totalisable si SwapPss dispo, sinon c'est une approximation (comme original)
-        swaps[cmd] = swaps.get(cmd, 0) + swap_kb
-
-        counts[cmd] = counts.get(cmd, 0) + 1
+        usage.pss_kb += pss_kb
+        usage.private_base_kb += private_base_kb
+        usage.huge_private_kb += huge_priv_kb
+        usage.swap_kb += swap_kb
+        usage.count += 1
 
     if shared_hugetlb_candidate_pids:
         pss_like_shared_hugetlb, failed_pid_count = estimate_shared_hugetlb_pss_like(
@@ -668,25 +695,30 @@ def get_memory_usage(
             pid_starttimes=pid_starttimes,
             candidate_pids=shared_hugetlb_candidate_pids,
         )
-        # max reste une borne basse de securite; on prend la meilleure estimation.
+        # La valeur la plus élevée limite la sous-estimation, mais peut aussi surestimer.
         for cmd, pss_like_kb in pss_like_shared_hugetlb.items():
-            if huge_shareds.get(cmd, 0) < pss_like_kb:
-                huge_shareds[cmd] = pss_like_kb
+            usage = usage_by_cmd.get(cmd)
+            if usage is not None:
+                usage.huge_shared_kb = max(usage.huge_shared_kb, pss_like_kb)
         if failed_pid_count:
             print(
-                f"[WARN] Shared_Hugetlb precise pass skipped {failed_pid_count} PID(s); "
-                "kept max-based conservative floor (possible underestimation).",
+                f"[WARN] Shared_Hugetlb refinement could not inspect {failed_pid_count} PID(s); "
+                "fallback values were kept, so the result may be under- or overestimated.",
                 file=sys.stderr,
             )
 
-    for cmd in psses:
-        private_base_total = private_bases.get(cmd, 0)
-        huge_priv_total = huge_privs.get(cmd, 0)
-        huge_shared_total = huge_shareds.get(cmd, 0)
-        privates[cmd] = private_base_total + huge_priv_total
-        ram_useds[cmd] = psses.get(cmd, 0) + huge_priv_total + huge_shared_total
-        if ram_useds[cmd] < privates[cmd]:
-            ram_useds[cmd] = privates[cmd]
+    privates: Dict[str, int] = {}
+    ram_useds: Dict[str, int] = {}
+    for cmd, usage in usage_by_cmd.items():
+        private_kb = usage.private_base_kb + usage.huge_private_kb
+        privates[cmd] = private_kb
+        ram_useds[cmd] = max(
+            usage.pss_kb + usage.huge_private_kb + usage.huge_shared_kb,
+            private_kb,
+        )
+
+    counts = {cmd: usage.count for cmd, usage in usage_by_cmd.items()}
+    swaps = {cmd: usage.swap_kb for cmd, usage in usage_by_cmd.items()}
 
     total_ram_used = sum(ram_useds.values())
     total_swap = sum(swaps.values())
@@ -706,10 +738,13 @@ def get_memory_usage(
         found_readable_pids=found_readable_pids,
         found_access_denied_pids=found_access_denied_pids,
         found_missing_runtime_pids=found_missing_runtime_pids,
+        found_reused_pids=found_reused_pids,
+        found_invalid_data_pids=found_invalid_data_pids,
     )
 
 
 def print_header(show_swap: bool) -> None:
+    """Affiche l'en-tête des colonnes de mémoire et, si demandé, du swap."""
     hdr = f"{'Private':>9} + {'Shared':>9} = {'RAM used':>9}"
     if show_swap:
         hdr += f"   {'Swap used':>9}"
@@ -717,15 +752,17 @@ def print_header(show_swap: bool) -> None:
 
 
 def print_timestamp() -> None:
+    """Affiche l'horodatage sur le flux adapté au mode de sortie."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     stream = sys.stdout if sys.stdout.isatty() else sys.stderr
     print(f"Timestamp: {stamp}", file=stream)
 
 
 def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, total_swap, show_swap: bool) -> None:
+    """Affiche le détail par commande et les totaux de la collecte."""
     for cmd, ram_used in sorted_cmds:
         private = privates.get(cmd, 0)
-        # Shared "proportionnel" pour que Private + Shared = RAM used
+        # Shared est déduit du total afin que Private + Shared = RAM used.
         shared = ram_used - private
 
         line = f"{human(private):>9} + {human(shared):>9} = {human(ram_used):>9}"
@@ -733,35 +770,57 @@ def print_memory_usage(sorted_cmds, privates, counts, total_ram_used, swaps, tot
             line += f"   {human(swaps.get(cmd, 0)):>9}"
         print(f"{line}\t{cmd_with_count(cmd, counts[cmd])}")
 
-    # RUN : Le pied de page inclut le Swap uniquement si -S/--swap est demande.
     if show_swap:
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM, {human(total_swap)} Swap\n")
     else:
         print(f"\n{'-' * 45}\n{'Total:':>30} {human(total_ram_used)} RAM\n")
 
 
-def _pid_issue_sets(result: MemoryUsageResult, requested_pids: List[int]) -> Tuple[set[int], set[int], set[int], set[int]]:
+def _pid_issue_sets(
+    result: MemoryUsageResult,
+    requested_pids: List[int],
+) -> Tuple[set[int], set[int], set[int], set[int], set[int], set[int]]:
+    """Classe les PID demandés selon la cause de leur absence des résultats."""
     missing_from_proc = set(requested_pids) - result.found_candidate_pids
     access_denied = result.found_access_denied_pids
     disappeared_runtime = result.found_missing_runtime_pids
+    reused = result.found_reused_pids
+    invalid_data = result.found_invalid_data_pids
     unreadable_other = (
         result.found_candidate_pids
         - result.found_readable_pids
         - access_denied
         - disappeared_runtime
+        - reused
+        - invalid_data
     )
-    return missing_from_proc, access_denied, disappeared_runtime, unreadable_other
+    return missing_from_proc, access_denied, disappeared_runtime, reused, invalid_data, unreadable_other
 
 
 def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[int], level: str) -> bool:
-    missing_from_proc, access_denied, disappeared_runtime, unreadable_other = _pid_issue_sets(result, requested_pids)
+    """Signale les PID ignorés et indique si un message a été émis."""
+    (
+        missing_from_proc,
+        access_denied,
+        disappeared_runtime,
+        reused,
+        invalid_data,
+        unreadable_other,
+    ) = _pid_issue_sets(result, requested_pids)
     emitted = False
     prefix = f"{level}: "
 
     if access_denied:
         print(
-            prefix + "Access denied reading smaps* for PID(s): "
+            prefix + "Access denied reading stat or smaps* for PID(s): "
             f"{', '.join(str(pid) for pid in sorted(access_denied))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if reused:
+        print(
+            prefix + "PID(s) reused during collection (identity changed): "
+            f"{', '.join(str(pid) for pid in sorted(reused))}.",
             file=sys.stderr,
         )
         emitted = True
@@ -769,6 +828,13 @@ def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[in
         print(
             prefix + "PID(s) disappeared during collection: "
             f"{', '.join(str(pid) for pid in sorted(disappeared_runtime))}.",
+            file=sys.stderr,
+        )
+        emitted = True
+    if invalid_data:
+        print(
+            prefix + "Invalid data read from stat/smaps* for PID(s): "
+            f"{', '.join(str(pid) for pid in sorted(invalid_data))}.",
             file=sys.stderr,
         )
         emitted = True
@@ -781,7 +847,7 @@ def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[in
         emitted = True
     if unreadable_other:
         print(
-            prefix + "Specified PIDs present but unreadable via smaps* (unknown cause): "
+            prefix + "Specified PIDs present but unreadable via stat/smaps* (unknown cause): "
             f"{', '.join(str(pid) for pid in sorted(unreadable_other))}.",
             file=sys.stderr,
         )
@@ -791,6 +857,7 @@ def _print_pid_issue_messages(result: MemoryUsageResult, requested_pids: List[in
 
 
 def main() -> None:
+    """Exécute une collecte unique ou répétée selon les options."""
     sys.stdout = Unbuffered(sys.stdout)
     sys.stderr = Unbuffered(sys.stderr)
 
@@ -801,10 +868,6 @@ def main() -> None:
         sys.exit(1)
 
     while True:
-        # RUN : On distingue PIDs candidats vs lisibles pour eviter un faux
-        # "PSS absent" quand un process disparait ou que smaps est illisible.
-        # En mode watch, on continue la surveillance (continue) au lieu de sortir.
-        # SwapPss est prefere a Swap quand present pour eviter un melange de modes.
         print_timestamp()
         result = get_memory_usage(
             pids_to_show=pids_to_show,
@@ -817,7 +880,10 @@ def main() -> None:
                 print(human(0))
             else:
                 if pids_to_show:
-                    print(f"No processes found for specified PIDs (not present in /proc): {', '.join(str(pid) for pid in pids_to_show)}")
+                    print(
+                        "No processes found for specified PIDs (not present in /proc): "
+                        f"{', '.join(str(pid) for pid in pids_to_show)}"
+                    )
                 else:
                     print(f"No matching processes for keywords: {', '.join(TARGET_KEYWORDS)}")
             if watch is None:
@@ -831,13 +897,13 @@ def main() -> None:
                 if not emitted:
                     print(
                         "ERROR: Specified PIDs found but none readable "
-                        "(stat/smaps access, process exit or PID reuse).",
+                        "(stat/smaps unavailable or invalid, process exit or PID reuse).",
                         file=sys.stderr,
                     )
             else:
                 print(
                     "ERROR: Matching processes found but none readable "
-                    "(stat/smaps access, process exit or PID reuse).",
+                    "(stat/smaps unavailable or invalid, process exit or PID reuse).",
                     file=sys.stderr,
                 )
             if watch is None:
@@ -845,16 +911,16 @@ def main() -> None:
             time.sleep(watch)
             continue
 
-        # En mode -p, avertir aussi en cas d'erreurs partielles (si au moins un
-        # PID est lisible, on continue mais on n'ignore pas silencieusement les
-        # PID refuses/disparus/manquants).
+        # Signaler les erreurs partielles sans perdre les résultats des PID lisibles.
         if pids_to_show:
             _print_pid_issue_messages(result, pids_to_show, level="WARN")
 
-        # On echoue rapidement si PSS est absent pour eviter d'afficher des zeros trompeurs.
+        # Sans champ Pss, les totaux seraient trompeurs : ne pas les afficher.
         if not result.pss_seen_any:
             print(
-                "ERROR: PSS not available/readable (no 'Pss:' lines found in smaps/smaps_rollup). Results would be unreliable.",
+                "ERROR: PSS not available/readable "
+                "(no 'Pss:' lines found in smaps/smaps_rollup). "
+                "Results would be unreliable.",
                 file=sys.stderr,
             )
             if watch is None:
