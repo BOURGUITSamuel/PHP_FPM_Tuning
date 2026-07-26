@@ -196,17 +196,41 @@ script avec un code non nul. En mode `-w`, les absences temporaires, les
 problèmes de lecture récupérables et l’absence de PSS provoquent une nouvelle
 tentative après l’intervalle demandé.
 
-## Limites connues
+## Limites connues et portée des résultats
 
-- Les résultats constituent un instantané et peuvent évoluer immédiatement
-  après la collecte.
-- Le repli vers `smaps` peut être plus coûteux que `smaps_rollup` sur un
-  processus possédant beaucoup de mappings.
-- L’heuristique `Shared_Hugetlb` peut sous-estimer ou surévaluer l’attribution
-  entre groupes de commandes.
-- Le regroupement PHP-FPM dépend des titres réellement publiés par les
-  processus.
-- Les totaux restent limités au périmètre sélectionné.
+Ces limites décrivent le cadre normal d’une mesure réalisée à partir de
+`/proc`. Dans l’usage prévu du script — diagnostic, comparaison et
+dimensionnement d’Apache ou de PHP-FPM — elles ne sont généralement pas
+contraignantes. Elles précisent surtout comment interpréter les résultats sans
+leur attribuer une exactitude qu’une observation en temps réel ne peut pas
+garantir.
+
+- **Mesure instantanée.** La mémoire peut évoluer dès la fin de la collecte,
+  comme avec tout outil d’observation d’un système actif. Une mesure reste
+  exploitable pour établir un état ponctuel, et le mode `-w` permet de suivre
+  la tendance. Le contrôle de l’identité des PID évite en outre de mélanger les
+  données de processus disparus ou réutilisés.
+- **Repli vers `smaps`.** Le repli complet, plus coûteux sur les processus
+  possédant beaucoup de mappings, n’est utilisé que lorsque `smaps_rollup` ne
+  peut pas être lu. Une seconde lecture ciblée de `smaps` peut aussi intervenir
+  pour affiner une valeur `Shared_Hugetlb` non nulle. Ces lectures restent
+  adaptées à un diagnostic ponctuel ; sur un serveur très chargé, un intervalle
+  `-w` raisonnable évite simplement de les répéter trop souvent.
+- **Estimation de `Shared_Hugetlb`.** Cette limite n’a aucun effet lorsque
+  `Shared_Hugetlb` vaut zéro. Lorsqu’il est utilisé, le script tente une
+  répartition plus précise et signale les lectures incomplètes. La valeur reste
+  adaptée à l’observation et à la comparaison, mais ne doit pas être considérée
+  comme une attribution comptable exacte entre plusieurs groupes.
+- **Identification des pools PHP-FPM.** Si PHP-FPM publie le nom de ses pools,
+  le script les regroupe séparément. Dans le cas contraire, les processus
+  restent mesurés et sont regroupés sous un libellé de repli : seule la
+  ventilation par pool est moins précise, pas le total des processus
+  sélectionnés.
+- **Périmètre des totaux.** Le total porte volontairement sur les processus
+  retenus par le filtre Apache/PHP ou indiqués avec `-p`. Il représente donc
+  correctement le périmètre étudié, mais pas la mémoire globale du serveur.
+  Cette sélection rend le résultat plus directement exploitable pour le
+  dimensionnement des services ciblés.
 
 ## Licence
 
