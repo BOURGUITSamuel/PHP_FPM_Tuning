@@ -1,0 +1,95 @@
+name: ps_mem.py CI
+
+on:
+  push:
+    branches: ["main", "php_tuning"]
+  pull_request:
+    branches: ["main", "php_tuning"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+
+      - name: Check Python syntax
+        run: python -m py_compile ps_mem.py
+
+      - name: Check command-line interface
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Eq \
+            '^[0-9]+([.][0-9]+)+$' \
+            <<< "$(python ps_mem.py --version)"
+
+          help_output="$(python ps_mem.py --help)"
+          for option in \
+            "--split-args" "--total" "--discriminate-by-pid" \
+            "--swap" "-p <pid>" "-w <N>"
+          do
+            grep -Fq -- "$option" <<< "$help_output"
+          done
+
+      - name: Check invalid PID handling
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          error_output="$(mktemp)"
+          trap 'rm -f "$error_output"' EXIT
+
+          if python ps_mem.py -p "" >/dev/null 2>"$error_output"; then
+            echo "An empty PID filter should be rejected."
+            exit 1
+          fi
+
+          grep -Fq \
+            "PIDs must be positive integers separated by commas." \
+            "$error_output"
+
+      - name: Smoke test against proc
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sleep 30 &
+          test_pid=$!
+          detail_output="$(mktemp)"
+          total_output="$(mktemp)"
+
+          cleanup() {
+            kill "$test_pid" 2>/dev/null || true
+            rm -f "$detail_output" "$total_output"
+          }
+          trap cleanup EXIT
+
+          for _ in {1..20}; do
+            grep -Fxq "sleep" "/proc/$test_pid/comm" && break
+            sleep 0.05
+          done
+          grep -Fxq "sleep" "/proc/$test_pid/comm"
+
+          python ps_mem.py -p "$test_pid" >"$detail_output"
+          grep -Fq "sleep" "$detail_output"
+          grep -Fq "Total:" "$detail_output"
+
+          python ps_mem.py -t -p "$test_pid" >"$total_output"
+          grep -Eq \
+            '^[0-9]+\.[0-9] (KiB|MiB|GiB|TiB|PiB)$' \
+            "$total_output"
