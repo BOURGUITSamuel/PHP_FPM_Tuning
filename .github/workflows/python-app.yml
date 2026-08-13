@@ -97,7 +97,10 @@ jobs:
   integration-services:
     name: Apache and PHP-FPM integration
     needs: build
-    if: github.event_name != 'pull_request'
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
