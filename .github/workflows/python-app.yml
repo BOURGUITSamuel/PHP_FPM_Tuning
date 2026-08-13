@@ -1,0 +1,231 @@
+name: ps_mem.py CI
+
+on:
+  push:
+    branches: ["main", "php_tuning"]
+  pull_request:
+    branches: ["main", "php_tuning"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+
+      - name: Check Python syntax
+        run: python -m py_compile ps_mem.py
+
+      - name: Check command-line interface
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          grep -Eq \
+            '^[0-9]+([.][0-9]+)+$' \
+            <<< "$(python ps_mem.py --version)"
+
+          help_output="$(python ps_mem.py --help)"
+          for option in \
+            "--split-args" "--total" "--discriminate-by-pid" \
+            "--swap" "-p <pid>" "-w <N>"
+          do
+            grep -Fq -- "$option" <<< "$help_output"
+          done
+
+      - name: Check invalid PID handling
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          error_output="$(mktemp)"
+          trap 'rm -f "$error_output"' EXIT
+
+          if python ps_mem.py -p "" >/dev/null 2>"$error_output"; then
+            echo "An empty PID filter should be rejected."
+            exit 1
+          fi
+
+          grep -Fq \
+            "PIDs must be positive integers separated by commas." \
+            "$error_output"
+
+      - name: Smoke test against proc
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sleep 30 &
+          test_pid=$!
+          detail_output="$(mktemp)"
+          total_output="$(mktemp)"
+
+          cleanup() {
+            kill "$test_pid" 2>/dev/null || true
+            rm -f "$detail_output" "$total_output"
+          }
+          trap cleanup EXIT
+
+          for _ in {1..20}; do
+            grep -Fxq "sleep" "/proc/$test_pid/comm" && break
+            sleep 0.05
+          done
+          grep -Fxq "sleep" "/proc/$test_pid/comm"
+
+          python ps_mem.py -p "$test_pid" >"$detail_output"
+          grep -Fq "sleep" "$detail_output"
+          grep -Fq "Total:" "$detail_output"
+
+          python ps_mem.py -t -p "$test_pid" >"$total_output"
+          grep -Eq \
+            '^[0-9]+\.[0-9] (KiB|MiB|GiB|TiB|PiB)$' \
+            "$total_output"
+
+  integration-services:
+    name: Apache and PHP-FPM integration
+    needs: build
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+
+      - name: Install Apache and PHP-FPM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends apache2 curl php-fpm
+
+      - name: Test Apache, PHP-FPM, and ps_mem.py
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fpm_service="$(
+            systemctl list-unit-files --type=service --no-legend |
+              awk '$1 ~ /^php[0-9]+[.][0-9]+-fpm[.]service$/ && !found {
+                print $1
+                found = 1
+              }'
+          )"
+          if [[ -z "$fpm_service" ]]; then
+            echo "No PHP-FPM systemd service was found."
+            exit 1
+          fi
+
+          fpm_conf="${fpm_service%.service}"
+          php_probe="/var/www/html/ps_mem-ci.php"
+          detail_output="$(mktemp)"
+          total_output="$(mktemp)"
+          http_output="$(mktemp)"
+
+          cleanup() {
+            rm -f "$detail_output" "$total_output" "$http_output"
+            sudo rm -f "$php_probe" || true
+          }
+          trap cleanup EXIT
+
+          sudo a2enmod proxy_fcgi setenvif
+          sudo a2enconf "$fpm_conf"
+          printf '%s\n' \
+            '<?php echo "php-fpm-integration-ok:" . PHP_SAPI;' |
+            sudo tee "$php_probe" >/dev/null
+
+          sudo systemctl restart "$fpm_service" apache2
+          sudo systemctl is-active apache2
+          sudo systemctl is-active "$fpm_service"
+
+          services_ready=false
+          for _ in {1..50}; do
+            if pgrep -x apache2 >/dev/null && \
+              pgrep -f '^php-fpm: pool www$' >/dev/null
+            then
+              services_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [[ "$services_ready" != true ]]; then
+            ps -eo pid,comm,args | grep -E '[a]pache2|[p]hp-fpm' || true
+            exit 1
+          fi
+
+          ps -eo pid,comm,args | grep -E '[a]pache2|[p]hp-fpm'
+
+          http_ready=false
+          for _ in {1..50}; do
+            if curl --fail --silent --max-time 2 --noproxy '*' \
+              http://127.0.0.1/ps_mem-ci.php >"$http_output" && \
+              grep -Fxq "php-fpm-integration-ok:fpm-fcgi" "$http_output"
+            then
+              http_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [[ "$http_ready" != true ]]; then
+            echo "Apache to PHP-FPM probe failed. Response:"
+            cat "$http_output"
+            sudo systemctl --no-pager --full status \
+              apache2 "$fpm_service" || true
+            exit 1
+          fi
+
+          python_bin="$(command -v python)"
+          sudo "$python_bin" ps_mem.py >"$detail_output"
+          grep -Fq "apache2" "$detail_output"
+          grep -Fq "php-fpm: pool www" "$detail_output"
+          grep -Fq "Total:" "$detail_output"
+
+          sudo "$python_bin" ps_mem.py -t >"$total_output"
+          grep -Eq \
+            '^[0-9]+\.[0-9] (KiB|MiB|GiB|TiB|PiB)$' \
+            "$total_output"
+
+          printf 'HTTP probe response: %s\n' "$(cat "$http_output")"
+          echo "ps_mem.py output:"
+          cat "$detail_output"
+          echo "ps_mem.py total: $(cat "$total_output")"
+
+          {
+            echo "### Apache and PHP-FPM integration"
+            echo
+            echo "- Apache service: active"
+            echo "- PHP-FPM service: $fpm_service (active)"
+            echo "- HTTP response: $(cat "$http_output")"
+            echo "- ps_mem.py total: $(cat "$total_output")"
+            echo
+            echo '```text'
+            cat "$detail_output"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
