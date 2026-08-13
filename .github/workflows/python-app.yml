@@ -93,3 +93,82 @@ jobs:
           grep -Eq \
             '^[0-9]+\.[0-9] (KiB|MiB|GiB|TiB|PiB)$' \
             "$total_output"
+
+  integration-services:
+    name: Apache and PHP-FPM integration
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+
+      - name: Install Apache and PHP-FPM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install --yes --no-install-recommends apache2 php-fpm
+
+      - name: Test Apache and PHP-FPM collection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fpm_service="$(
+            systemctl list-unit-files --type=service --no-legend |
+              awk '$1 ~ /^php[0-9]+[.][0-9]+-fpm[.]service$/ && !found {
+                print $1
+                found = 1
+              }'
+          )"
+          if [[ -z "$fpm_service" ]]; then
+            echo "No PHP-FPM systemd service was found."
+            exit 1
+          fi
+
+          sudo systemctl start apache2 "$fpm_service"
+          sudo systemctl is-active --quiet apache2
+          sudo systemctl is-active --quiet "$fpm_service"
+
+          services_ready=false
+          for _ in {1..50}; do
+            if pgrep -x apache2 >/dev/null && \
+              pgrep -f '^php-fpm: pool www$' >/dev/null
+            then
+              services_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+
+          if [[ "$services_ready" != true ]]; then
+            ps -eo pid,comm,args | grep -E '[a]pache2|[p]hp-fpm' || true
+            exit 1
+          fi
+
+          detail_output="$(mktemp)"
+          total_output="$(mktemp)"
+          trap 'rm -f "$detail_output" "$total_output"' EXIT
+
+          python_bin="$(command -v python)"
+          sudo "$python_bin" ps_mem.py >"$detail_output"
+          grep -Fq "apache2" "$detail_output"
+          grep -Fq "php-fpm: pool www" "$detail_output"
+          grep -Fq "Total:" "$detail_output"
+
+          sudo "$python_bin" ps_mem.py -t >"$total_output"
+          grep -Eq \
+            '^[0-9]+\.[0-9] (KiB|MiB|GiB|TiB|PiB)$' \
+            "$total_output"
